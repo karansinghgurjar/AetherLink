@@ -883,7 +883,7 @@ pub async fn run_session_over_stream<S>(
                             );
                             file_transfers.insert(transfer_id.clone(), state);
                             log_event(format!(
-                                "File transfer started from {peer_addr}: transfer_id={transfer_id} filename={filename} expected_size={size} expected_sha256={}",
+                                "File transfer started from {peer_addr}: transfer_id={transfer_id} filename={filename} expected_size={size} expected_sha256={} saved_path={started_path}",
                                 expected_sha256_for_log.as_deref().unwrap_or("none")
                             ));
                         }
@@ -1019,8 +1019,8 @@ pub async fn run_session_over_stream<S>(
                             match finalize_file_transfer(&mut state) {
                                 Ok(result) => {
                                     log_event(format!(
-                                        "File transfer completed: transfer_id={} filename={} bytes_received={} checksum_ok={}",
-                                        result.transfer_id, result.filename, result.bytes_received, result.checksum_ok
+                                        "File transfer completed: transfer_id={} filename={} bytes_received={} checksum_ok={} saved_path={}",
+                                        result.transfer_id, result.filename, result.bytes_received, result.checksum_ok, result.saved_path
                                     ));
                                     let _ = send_control_event(
                                         &input_control_tx,
@@ -1192,6 +1192,17 @@ pub async fn run_session_over_stream<S>(
             }
         };
 
+        while let Ok(payload) = control_rx.try_recv() {
+            if let Err(err) =
+                protocol::write_message(&mut write_half, protocol::MSG_CONTROL_INPUT, &payload).await
+            {
+                log_event(format!(
+                    "Client {peer_addr} disconnected while sending control event: {err}"
+                ));
+                break 'write_loop;
+            }
+        }
+
         if config_snapshot.audio_enabled {
             if !audio_capture_running {
                 let (fresh_audio_tx, fresh_audio_rx) =
@@ -1213,6 +1224,8 @@ pub async fn run_session_over_stream<S>(
             log_event(format!("Audio capture stopped for {peer_addr}"));
         }
 
+        let capture_started_at = Instant::now();
+        let capture_timestamp_ms = now_epoch_millis();
         let (width, height, rgba) =
             match screen_capture::capture_desktop_rgba_with_config(&config_snapshot) {
                 Ok(frame) => frame,
@@ -1221,6 +1234,7 @@ pub async fn run_session_over_stream<S>(
                     break;
                 }
             };
+        let capture_duration_ms = capture_started_at.elapsed().as_millis();
 
         let force_keyframe_now = force_keyframe.swap(false, Ordering::SeqCst);
         let maybe_plan = if !force_keyframe_now
@@ -1257,8 +1271,10 @@ pub async fn run_session_over_stream<S>(
         }
 
         if need_keyframe {
+            let encode_started_at = Instant::now();
             let payload = match delta_stream::encode_keyframe_payload(
                 next_frame_id,
+                capture_timestamp_ms,
                 width,
                 height,
                 &rgba,
@@ -1270,6 +1286,9 @@ pub async fn run_session_over_stream<S>(
                     break;
                 }
             };
+            let encode_duration_ms = encode_started_at.elapsed().as_millis();
+            let payload_len = payload.len();
+            let send_started_at = Instant::now();
             if let Err(err) =
                 protocol::write_message(&mut write_half, protocol::MSG_VIDEO_KEYFRAME, &payload).await
             {
@@ -1277,6 +1296,20 @@ pub async fn run_session_over_stream<S>(
                     "Client {peer_addr} disconnected while sending keyframe: {err}"
                 ));
                 break;
+            }
+            let send_duration_ms = send_started_at.elapsed().as_millis();
+            if next_frame_id % 30 == 0 {
+                log_event(format!(
+                    "Frame sample host frame_id={} type=keyframe capture_ts_ms={} capture_ms={} encode_ms={} send_ms={} bytes={} width={} height={}",
+                    next_frame_id,
+                    capture_timestamp_ms,
+                    capture_duration_ms,
+                    encode_duration_ms,
+                    send_duration_ms,
+                    payload_len,
+                    width,
+                    height
+                ));
             }
             telemetry.keyframes_sent += 1;
             telemetry.last_patch_count = 0;
@@ -1292,9 +1325,11 @@ pub async fn run_session_over_stream<S>(
             let changed_ratio = delta_stream::changed_ratio(&plan, width, height);
             let move_count = plan.moves.len();
             let patch_count = plan.patches.len();
+            let encode_started_at = Instant::now();
             let payload = match delta_stream::encode_delta_payload(
                 next_frame_id,
                 last_frame_id,
+                capture_timestamp_ms,
                 width,
                 height,
                 &rgba,
@@ -1307,6 +1342,9 @@ pub async fn run_session_over_stream<S>(
                     break;
                 }
             };
+            let encode_duration_ms = encode_started_at.elapsed().as_millis();
+            let payload_len = payload.len();
+            let send_started_at = Instant::now();
             if let Err(err) =
                 protocol::write_message(&mut write_half, protocol::MSG_VIDEO_DELTA, &payload).await
             {
@@ -1314,6 +1352,23 @@ pub async fn run_session_over_stream<S>(
                     "Client {peer_addr} disconnected while sending delta frame: {err}"
                 ));
                 break;
+            }
+            let send_duration_ms = send_started_at.elapsed().as_millis();
+            if next_frame_id % 30 == 0 {
+                log_event(format!(
+                    "Frame sample host frame_id={} type=delta capture_ts_ms={} capture_ms={} encode_ms={} send_ms={} bytes={} width={} height={} moves={} patches={} changed_ratio={:.3}",
+                    next_frame_id,
+                    capture_timestamp_ms,
+                    capture_duration_ms,
+                    encode_duration_ms,
+                    send_duration_ms,
+                    payload_len,
+                    width,
+                    height,
+                    move_count,
+                    patch_count,
+                    changed_ratio
+                ));
             }
             telemetry.delta_frames_sent += 1;
             telemetry.last_patch_count = patch_count;
@@ -1470,17 +1525,6 @@ pub async fn run_session_over_stream<S>(
             }
         }
 
-        while let Ok(payload) = control_rx.try_recv() {
-            if let Err(err) =
-                protocol::write_message(&mut write_half, protocol::MSG_CONTROL_INPUT, &payload).await
-            {
-                log_event(format!(
-                    "Client {peer_addr} disconnected while sending control event: {err}"
-                ));
-                break 'write_loop;
-            }
-        }
-
         if let Err(err) = write_half.flush().await {
             log_event(format!("Client {peer_addr} disconnected while flushing stream: {err}"));
             break;
@@ -1611,6 +1655,14 @@ fn generate_sync_id(source: &str) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{source}-{nanos}")
+}
+
+#[cfg(windows)]
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(windows)]
