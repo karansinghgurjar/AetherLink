@@ -54,9 +54,9 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            target_width: Some(1280),
-            fps: 20,
-            jpeg_quality: 70,
+            target_width: Some(960),
+            fps: 15,
+            jpeg_quality: 60,
             view_only: false,
             monitor_index: 0,
             clipboard_mode: ClipboardMode::Manual,
