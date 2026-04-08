@@ -130,6 +130,15 @@ AetherLink is a secure remote desktop system with:
   - sampled host capture / encode / send timing logs added
   - sampled client receive / replace / decode / render timing logs added
   - sampled protocol / audio receive / audio playback logs added
+- startup and transport recovery hardening added:
+  - first-frame startup now uses a grace window before strict stale dropping
+  - stale-drop decisions now use client-local queue age instead of cross-device wall-clock age
+  - stream phases now distinguish `connecting`, `awaiting_first_frame`, and `streaming`
+  - health timeout no longer aggressively resyncs before first render
+  - resync requests are guarded to avoid storms while waiting for a replacement keyframe
+  - client enables `TCP_NODELAY`
+  - host enables `TCP_NODELAY` and now applies bounded write/flush timeouts so stalled sends fail fast instead of hanging silently
+  - if a resync keyframe never arrives, the client now falls back to reconnect instead of waiting indefinitely
 - monitor inventory/status sync
 - phone touch input works through relay
 - remote landscape fullscreen mode added on phone
