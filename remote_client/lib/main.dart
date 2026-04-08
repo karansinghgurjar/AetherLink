@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -20,6 +22,7 @@ class RemoteApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'AetherLink',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
@@ -28,7 +31,8 @@ class RemoteApp extends StatelessWidget {
   }
 }
 
-enum ResolutionPreset { low, medium, high }
+enum ResolutionPreset { ultra, low, medium, high }
+
 enum ClipboardSyncMode { manual, hostToClient, clientToHost, bidirectional }
 
 String _clipboardModeToWire(ClipboardSyncMode mode) {
@@ -59,18 +63,15 @@ enum ConnectionStage {
   error,
 }
 
-enum TrustState {
-  unpaired,
-  pending,
-  trusted,
-  rejected,
-  revoked,
-}
+enum TrustState { unpaired, pending, trusted, rejected, revoked }
 
-enum StreamPhase {
-  connecting,
-  awaitingFirstFrame,
-  streaming,
+enum StreamPhase { connecting, awaitingFirstFrame, streaming }
+
+class _ViewportLayout {
+  const _ViewportLayout({required this.imageRect, required this.baseSize});
+
+  final Rect imageRect;
+  final Size baseSize;
 }
 
 class _SettingsState {
@@ -85,6 +86,8 @@ class _SettingsState {
 
   int get targetWidth {
     switch (resolution) {
+      case ResolutionPreset.ultra:
+        return 640;
       case ResolutionPreset.low:
         return 720;
       case ResolutionPreset.medium:
@@ -92,6 +95,39 @@ class _SettingsState {
       case ResolutionPreset.high:
         return 1280;
     }
+  }
+}
+
+class _RollingIntStats {
+  _RollingIntStats();
+
+  static const int _maxSamples = 240;
+  final List<int> _samples = <int>[];
+
+  void add(int value) {
+    _samples.add(value);
+    if (_samples.length > _maxSamples) {
+      _samples.removeAt(0);
+    }
+  }
+
+  bool get isEmpty => _samples.isEmpty;
+
+  String get averageLabel {
+    if (_samples.isEmpty) {
+      return '-';
+    }
+    final total = _samples.fold<int>(0, (sum, value) => sum + value);
+    return (total / _samples.length).toStringAsFixed(1);
+  }
+
+  int get p95 {
+    if (_samples.isEmpty) {
+      return 0;
+    }
+    final sorted = List<int>.from(_samples)..sort();
+    final index = ((sorted.length - 1) * 0.95).floor();
+    return sorted[index];
   }
 }
 
@@ -133,23 +169,23 @@ class SavedHostEntry {
   final bool audioEnabled;
 
   Map<String, Object> toJson() => <String, Object>{
-        'label': label,
-        'host': host,
-        'port': port,
-        'token': token,
-        'use_relay_mode': useRelayMode,
-        'relay_host_id': relayHostId,
-        'relay_token': relayToken,
-        'resolution': resolution.name,
-        'fps': fps,
-        'jpeg_quality': jpegQuality,
-        'view_only': viewOnly,
-        'monitor_index': monitorIndex,
-        'auto_reconnect': autoReconnect,
-        'clipboard_mode': clipboardMode.name,
-        'delta_stream_enabled': deltaStreamEnabled,
-        'audio_enabled': audioEnabled,
-      };
+    'label': label,
+    'host': host,
+    'port': port,
+    'token': token,
+    'use_relay_mode': useRelayMode,
+    'relay_host_id': relayHostId,
+    'relay_token': relayToken,
+    'resolution': resolution.name,
+    'fps': fps,
+    'jpeg_quality': jpegQuality,
+    'view_only': viewOnly,
+    'monitor_index': monitorIndex,
+    'auto_reconnect': autoReconnect,
+    'clipboard_mode': clipboardMode.name,
+    'delta_stream_enabled': deltaStreamEnabled,
+    'audio_enabled': audioEnabled,
+  };
 
   factory SavedHostEntry.fromJson(Map<String, dynamic> json) {
     return SavedHostEntry(
@@ -172,7 +208,8 @@ class SavedHostEntry {
       monitorIndex: (json['monitor_index'] as num?)?.toInt() ?? 0,
       autoReconnect: json['auto_reconnect'] != false,
       clipboardMode: ClipboardSyncMode.values.firstWhere(
-        (value) => value == _clipboardModeFromWire(json['clipboard_mode'] as String?),
+        (value) =>
+            value == _clipboardModeFromWire(json['clipboard_mode'] as String?),
         orElse: () => ClipboardSyncMode.manual,
       ),
       deltaStreamEnabled: json['delta_stream_enabled'] != false,
@@ -194,17 +231,29 @@ class _LatestFramePresenter {
   final void Function(String message) onLog;
   final void Function(RemoteVideoFrame frame, int renderedAgeMs) onPresented;
   final bool Function() isAwaitingFirstFrame;
-  final ValueNotifier<ui.Image?> imageListenable = ValueNotifier<ui.Image?>(null);
+  final ValueNotifier<ui.Image?> imageListenable = ValueNotifier<ui.Image?>(
+    null,
+  );
   final ValueNotifier<Size?> frameSizeListenable = ValueNotifier<Size?>(null);
+  final ValueNotifier<String?> placeholderTextListenable =
+      ValueNotifier<String?>(null);
 
   RemoteVideoFrame? _pendingFrame;
   bool _rendering = false;
   int _replacedPendingCount = 0;
+  int _staleDropsAfterDecode = 0;
+  int _lastSummaryAtMs = 0;
+  final _RollingIntStats _receiveToRenderSubmitMs = _RollingIntStats();
+  final _RollingIntStats _decodeMs = _RollingIntStats();
+  final _RollingIntStats _renderWaitMs = _RollingIntStats();
 
   void submit(RemoteVideoFrame frame) {
     final awaitingFirstFrame = isAwaitingFirstFrame();
-    final staleThreshold = awaitingFirstFrame ? startupStaleFrameThresholdMs : staleFrameThresholdMs;
-    if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) && frame.queueAgeMs > staleThreshold) {
+    final staleThreshold = awaitingFirstFrame
+        ? startupStaleFrameThresholdMs
+        : staleFrameThresholdMs;
+    if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) &&
+        frame.queueAgeMs > staleThreshold) {
       onLog(
         'Render stale-frame drop: frame ${frame.frameId} queueAge=${frame.queueAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms threshold=${staleThreshold}ms phase=${awaitingFirstFrame ? 'awaiting_first_frame' : 'streaming'}',
       );
@@ -231,6 +280,7 @@ class _LatestFramePresenter {
     final previous = imageListenable.value;
     imageListenable.value = null;
     frameSizeListenable.value = null;
+    placeholderTextListenable.value = null;
     previous?.dispose();
   }
 
@@ -238,11 +288,28 @@ class _LatestFramePresenter {
     clear();
     imageListenable.dispose();
     frameSizeListenable.dispose();
+    placeholderTextListenable.dispose();
   }
 
   void _renderLatest(RemoteVideoFrame frame) {
     _rendering = true;
-    final renderStartMs = DateTime.now().millisecondsSinceEpoch;
+    final renderEnqueueMs = DateTime.now().millisecondsSinceEpoch;
+    _decodeMs.add(frame.decodeMs);
+    if (frame.isPlaceholder) {
+      final previous = imageListenable.value;
+      imageListenable.value = null;
+      frameSizeListenable.value = const Size(640, 360);
+      placeholderTextListenable.value = 'Decode bypass frame ${frame.frameId}';
+      previous?.dispose();
+      final renderSubmitMs = DateTime.now().millisecondsSinceEpoch;
+      _receiveToRenderSubmitMs.add(renderSubmitMs - frame.receivedTimestampMs);
+      _renderWaitMs.add(renderSubmitMs - renderEnqueueMs);
+      _maybeLogSummary();
+      onPresented(frame, renderSubmitMs - frame.receivedTimestampMs);
+      _rendering = false;
+      _drainPending();
+      return;
+    }
     ui.decodeImageFromPixels(
       frame.rgbaBytes,
       frame.width,
@@ -250,26 +317,51 @@ class _LatestFramePresenter {
       ui.PixelFormat.rgba8888,
       (ui.Image image) {
         final awaitingFirstFrame = isAwaitingFirstFrame();
-        final staleThreshold = awaitingFirstFrame ? startupStaleFrameThresholdMs : staleFrameThresholdMs;
-        final renderedAgeMs = DateTime.now().millisecondsSinceEpoch - frame.receivedTimestampMs;
-        if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) && renderedAgeMs > staleThreshold) {
+        final staleThreshold = awaitingFirstFrame
+            ? startupStaleFrameThresholdMs
+            : staleFrameThresholdMs;
+        final renderedAgeMs =
+            DateTime.now().millisecondsSinceEpoch - frame.receivedTimestampMs;
+        if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) &&
+            renderedAgeMs > staleThreshold) {
           image.dispose();
+          _staleDropsAfterDecode += 1;
           onLog(
             'Render stale-frame drop: frame ${frame.frameId} queueAge=${renderedAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms threshold=${staleThreshold}ms after decode',
           );
+          _maybeLogSummary();
           _rendering = false;
           _drainPending();
           return;
         }
         final previous = imageListenable.value;
         imageListenable.value = image;
-        frameSizeListenable.value = Size(frame.width.toDouble(), frame.height.toDouble());
+        frameSizeListenable.value = Size(
+          frame.width.toDouble(),
+          frame.height.toDouble(),
+        );
+        placeholderTextListenable.value = null;
         previous?.dispose();
+        final renderSubmitMs = DateTime.now().millisecondsSinceEpoch;
+        final renderWaitMs = renderSubmitMs - renderEnqueueMs;
+        _receiveToRenderSubmitMs.add(
+          renderSubmitMs - frame.receivedTimestampMs,
+        );
+        _renderWaitMs.add(renderWaitMs);
         if (frame.frameId % 30 == 0) {
           onLog(
-            'Render submitted: frame ${frame.frameId} queueAge=${renderedAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms renderWait=${DateTime.now().millisecondsSinceEpoch - renderStartMs}ms',
+            'Render submitted: frame ${frame.frameId} queueAge=${renderedAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms receive_to_decode_start_ms=${frame.receiveToDecodeStartMs} decode_ms=${frame.decodeMs} decode_to_render_enqueue_ms=${renderEnqueueMs - frame.decodeEndTimestampMs} render_wait_ms=$renderWaitMs receive_to_render_submit_ms=${renderSubmitMs - frame.receivedTimestampMs}',
           );
         }
+        SchedulerBinding.instance.addPostFrameCallback((_) {
+          final renderCompleteMs = DateTime.now().millisecondsSinceEpoch;
+          if (frame.frameId % 30 == 0) {
+            onLog(
+              'Render complete: frame ${frame.frameId} render_complete_delay_ms=${renderCompleteMs - renderSubmitMs}',
+            );
+          }
+        });
+        _maybeLogSummary();
         onPresented(frame, renderedAgeMs);
         _rendering = false;
         _drainPending();
@@ -284,6 +376,17 @@ class _LatestFramePresenter {
     if (nextFrame != null) {
       submit(nextFrame);
     }
+  }
+
+  void _maybeLogSummary() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastSummaryAtMs < 5000 || _receiveToRenderSubmitMs.isEmpty) {
+      return;
+    }
+    _lastSummaryAtMs = nowMs;
+    onLog(
+      'Video render summary: receive_to_render_submit_avg=${_receiveToRenderSubmitMs.averageLabel}ms p95=${_receiveToRenderSubmitMs.p95}ms decode_avg=${_decodeMs.averageLabel}ms p95=${_decodeMs.p95}ms render_wait_avg=${_renderWaitMs.averageLabel}ms p95=${_renderWaitMs.p95}ms replaced_before_render=$_replacedPendingCount stale_drops_after_decode=$_staleDropsAfterDecode',
+    );
   }
 }
 
@@ -324,10 +427,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   static const String _trustDeviceIdPrefsKey = 'trust_device_id';
   static const String _trustDeviceNamePrefsKey = 'trust_device_name';
 
-  final TextEditingController _hostController = TextEditingController(text: '10.0.2.2');
-  final TextEditingController _portController = TextEditingController(text: '6000');
+  final TextEditingController _hostController = TextEditingController(
+    text: '10.0.2.2',
+  );
+  final TextEditingController _portController = TextEditingController(
+    text: '6000',
+  );
   final TextEditingController _tokenController = TextEditingController();
-  final TextEditingController _relayHostIdController = TextEditingController(text: 'default-host');
+  final TextEditingController _relayHostIdController = TextEditingController(
+    text: 'default-host',
+  );
   final TextEditingController _relayTokenController = TextEditingController();
 
   final _settings = _SettingsState();
@@ -352,6 +461,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   bool _useRelayMode = false;
   Offset? _pointerDownPosition;
   bool _pointerMovedSinceDown = false;
+  int _activePointerCount = 0;
+  double _viewportScale = 1.0;
+  Offset _viewportPan = Offset.zero;
+  double _scaleStartViewportScale = 1.0;
+  Offset _scaleStartViewportPan = Offset.zero;
+  Offset? _scaleStartFocalPoint;
+  Offset? _cursorNormalizedPosition;
   double? _transferProgress;
   String? _transferStatus;
   String? _hostClipboardText;
@@ -386,6 +502,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   bool _awaitingResyncKeyframe = false;
   DateTime? _lastSessionActivityAt;
   DateTime? _lastResyncRequestAt;
+  int _presentedFrameCount = 0;
+  int _videoWidgetBuildCount = 0;
+  int _lastVideoUiSummaryAtMs = 0;
+
+  static const double _minViewportScale = 1.0;
+  static const double _maxViewportScale = 4.0;
 
   @override
   void initState() {
@@ -428,6 +550,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _reconnectAttempt = 0;
     _lastRenderedFrameAgeMs = renderedAgeMs;
     _awaitingResyncKeyframe = false;
+    _presentedFrameCount += 1;
+    _maybeLogVideoUiSummary();
     if (firstPresentedFrame) {
       _streamPhase = StreamPhase.streaming;
       final connectStartedAt = _connectStartedAt;
@@ -436,7 +560,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           'First frame rendered successfully: frame ${frame.frameId}, time_to_first_render_ms=${now.difference(connectStartedAt).inMilliseconds}, queue_age=${renderedAgeMs}ms',
         );
       } else {
-        _recordLog('First frame rendered successfully: frame ${frame.frameId}, queue_age=${renderedAgeMs}ms');
+        _recordLog(
+          'First frame rendered successfully: frame ${frame.frameId}, queue_age=${renderedAgeMs}ms',
+        );
       }
       _recordLog('Session phase changed to streaming');
     }
@@ -446,6 +572,112 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     if (firstPresentedFrame || frame.frameId % 10 == 0) {
       setState(() {});
     }
+  }
+
+  void _maybeLogVideoUiSummary() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastVideoUiSummaryAtMs < 5000) {
+      return;
+    }
+    _lastVideoUiSummaryAtMs = nowMs;
+    _recordLog(
+      'Video UI summary: frame_widget_builds=$_videoWidgetBuildCount presented_frames=$_presentedFrameCount debug_video_disabled=$kDebugVideoDisabled debug_audio_disabled=$kDebugAudioDisabled decode_bypass=$kDebugVideoDecodeBypass audio_only=$kDebugAudioOnlyMode',
+    );
+    _videoWidgetBuildCount = 0;
+    _presentedFrameCount = 0;
+  }
+
+  _ViewportLayout? _computeViewportLayout(
+    BoxConstraints constraints,
+    Size frameSize,
+  ) {
+    if (constraints.maxWidth <= 0 ||
+        constraints.maxHeight <= 0 ||
+        frameSize.width <= 0 ||
+        frameSize.height <= 0) {
+      return null;
+    }
+    final scale = math.min(
+      constraints.maxWidth / frameSize.width,
+      constraints.maxHeight / frameSize.height,
+    );
+    final baseSize = Size(frameSize.width * scale, frameSize.height * scale);
+    final scaledSize = Size(
+      baseSize.width * _viewportScale,
+      baseSize.height * _viewportScale,
+    );
+    final centeredOrigin = Offset(
+      (constraints.maxWidth - scaledSize.width) / 2,
+      (constraints.maxHeight - scaledSize.height) / 2,
+    );
+    final clampedPan = _clampViewportPan(constraints, scaledSize, _viewportPan);
+    final imageRect = centeredOrigin + clampedPan & scaledSize;
+    return _ViewportLayout(imageRect: imageRect, baseSize: baseSize);
+  }
+
+  Offset _clampViewportPan(
+    BoxConstraints constraints,
+    Size scaledSize,
+    Offset candidate,
+  ) {
+    final maxPanX = math.max(
+      0.0,
+      (scaledSize.width - constraints.maxWidth) / 2,
+    );
+    final maxPanY = math.max(
+      0.0,
+      (scaledSize.height - constraints.maxHeight) / 2,
+    );
+    return Offset(
+      candidate.dx.clamp(-maxPanX, maxPanX),
+      candidate.dy.clamp(-maxPanY, maxPanY),
+    );
+  }
+
+  Offset? _localToRemoteNormalized(
+    Offset localPosition,
+    BoxConstraints constraints,
+    Size frameSize,
+  ) {
+    final layout = _computeViewportLayout(constraints, frameSize);
+    if (layout == null) {
+      return null;
+    }
+    final rect = layout.imageRect;
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+    final normalized = Offset(
+      ((localPosition.dx - rect.left) / rect.width).clamp(0.0, 1.0),
+      ((localPosition.dy - rect.top) / rect.height).clamp(0.0, 1.0),
+    );
+    return normalized;
+  }
+
+  void _updateCursorNormalized(Offset position) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _cursorNormalizedPosition = position;
+    });
+  }
+
+  void _zoomBy(double scaleDelta) {
+    final next = (_viewportScale * scaleDelta).clamp(
+      _minViewportScale,
+      _maxViewportScale,
+    );
+    setState(() {
+      _viewportScale = next;
+    });
+  }
+
+  void _resetViewportTransform() {
+    setState(() {
+      _viewportScale = 1.0;
+      _viewportPan = Offset.zero;
+    });
   }
 
   Future<void> _loadSavedHosts() async {
@@ -463,7 +695,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     try {
       final decoded = jsonDecode(raw) as List<dynamic>;
       final entries = decoded
-          .map((item) => SavedHostEntry.fromJson((item as Map).cast<String, dynamic>()))
+          .map(
+            (item) =>
+                SavedHostEntry.fromJson((item as Map).cast<String, dynamic>()),
+          )
           .where((entry) => entry.host.isNotEmpty)
           .toList();
       final deduped = <SavedHostEntry>[];
@@ -481,7 +716,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _savedHosts = deduped;
         if (_selectedSavedHostLabel != null &&
-            _savedHosts.where((entry) => entry.label == _selectedSavedHostLabel).length != 1) {
+            _savedHosts
+                    .where((entry) => entry.label == _selectedSavedHostLabel)
+                    .length !=
+                1) {
           _selectedSavedHostLabel = null;
         }
         _loadingSavedHosts = false;
@@ -614,7 +852,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     await prefs.setString(_lastPortPrefsKey, _portController.text.trim());
     await prefs.setString(_lastTokenPrefsKey, _tokenController.text);
     await prefs.setBool(_lastUseRelayModePrefsKey, _useRelayMode);
-    await prefs.setString(_lastRelayHostIdPrefsKey, _relayHostIdController.text.trim());
+    await prefs.setString(
+      _lastRelayHostIdPrefsKey,
+      _relayHostIdController.text.trim(),
+    );
     await prefs.setString(_lastRelayTokenPrefsKey, _relayTokenController.text);
     await prefs.setString(_lastResolutionPrefsKey, _settings.resolution.name);
     await prefs.setInt(_lastFpsPrefsKey, _settings.fps);
@@ -622,7 +863,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     await prefs.setBool(_lastViewOnlyPrefsKey, _settings.viewOnly);
     await prefs.setInt(_lastMonitorIndexPrefsKey, _settings.monitorIndex);
     await prefs.setBool(_lastAutoReconnectPrefsKey, _autoReconnectEnabled);
-    await prefs.setString(_lastClipboardModePrefsKey, _clipboardModeToWire(_settings.clipboardMode));
+    await prefs.setString(
+      _lastClipboardModePrefsKey,
+      _clipboardModeToWire(_settings.clipboardMode),
+    );
     await prefs.setBool(_lastDeltaStreamPrefsKey, _settings.deltaStreamEnabled);
     await prefs.setBool(_lastAudioEnabledPrefsKey, _settings.audioEnabled);
     await prefs.setString(_trustStatePrefsKey, _trustState.name);
@@ -653,14 +897,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _settings.deltaStreamEnabled = entry.deltaStreamEnabled;
       _settings.audioEnabled = entry.audioEnabled;
       _message = 'Loaded host "${entry.label}".';
-      _recordLog('Loaded saved host ${entry.label} -> ${entry.host}:${entry.port}');
+      _recordLog(
+        'Loaded saved host ${entry.label} -> ${entry.host}:${entry.port}',
+      );
     });
     unawaited(_persistClientPrefs());
   }
 
   Future<void> _bootstrapTrustIdentity() async {
     try {
-      final identity = await AndroidTrustIdentityService.instance.getOrCreateDeviceIdentity();
+      final identity = await AndroidTrustIdentityService.instance
+          .getOrCreateDeviceIdentity();
       if (!mounted) {
         return;
       }
@@ -697,7 +944,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _trustedDeviceId = identity.deviceId;
         _trustedDeviceName = identity.deviceName;
         _trustState = TrustState.pending;
-        _recordLog('Pair request started for ${identity.deviceName} (${identity.deviceId})');
+        _recordLog(
+          'Pair request started for ${identity.deviceName} (${identity.deviceId})',
+        );
       });
       await _persistClientPrefs();
       await client.requestPairing(deviceName: identity.deviceName);
@@ -705,7 +954,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         return;
       }
       setState(() {
-        _message = forceRePair ? 'Re-pair request sent. Waiting for host approval.' : 'Pair request sent. Waiting for host approval.';
+        _message = forceRePair
+            ? 'Re-pair request sent. Waiting for host approval.'
+            : 'Pair request sent. Waiting for host approval.';
       });
       _showSnack('Pair request sent');
     } catch (e) {
@@ -760,7 +1011,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       if (host.isEmpty || port == null || port <= 0 || port > 65535) {
         setState(() {
           _message = 'Enter a valid host and port before saving.';
-          _recordLog('Save blocked: invalid host=$host port=${_portController.text.trim()}');
+          _recordLog(
+            'Save blocked: invalid host=$host port=${_portController.text.trim()}',
+          );
         });
         return;
       }
@@ -792,7 +1045,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         if (item.label == label) {
           return false;
         }
-        if (updateExisting && _selectedSavedHostLabel != null && item.label == _selectedSavedHostLabel) {
+        if (updateExisting &&
+            _selectedSavedHostLabel != null &&
+            item.label == _selectedSavedHostLabel) {
           return false;
         }
         return true;
@@ -872,10 +1127,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _message = isReconnect
           ? 'Reconnecting to $host:$port...'
           : (_useRelayMode
-              ? 'Connecting to relay $host:$port for host $relayHostId...'
-              : 'Connecting to $host:$port...');
+                ? 'Connecting to relay $host:$port for host $relayHostId...'
+                : 'Connecting to $host:$port...');
       _lastError = null;
-      _connectionStage = isReconnect ? ConnectionStage.reconnecting : ConnectionStage.connecting;
+      _connectionStage = isReconnect
+          ? ConnectionStage.reconnecting
+          : ConnectionStage.connecting;
       _recordLog(
         '${isReconnect ? 'Reconnect' : 'Connect'} requested for $host:$port'
         '${_useRelayMode ? ' (relay host_id=$relayHostId)' : ''}',
@@ -955,9 +1212,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             _connected = false;
             _hasRenderedFrame = false;
             _streamPhase = StreamPhase.connecting;
-            _connectionStage =
-                _manualDisconnectRequested ? ConnectionStage.stopped : ConnectionStage.disconnected;
-            _recordLog(_manualDisconnectRequested ? 'Disconnected by user' : 'Stream ended');
+            _connectionStage = _manualDisconnectRequested
+                ? ConnectionStage.stopped
+                : ConnectionStage.disconnected;
+            _recordLog(
+              _manualDisconnectRequested
+                  ? 'Disconnected by user'
+                  : 'Stream ended',
+            );
           });
           _framePresenter.clear();
           await _disconnect();
@@ -1023,7 +1285,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _lastControlAt = null;
         _lastSessionActivityAt = null;
         if (!_connecting && !_reconnecting) {
-          _connectionStage = manual ? ConnectionStage.stopped : ConnectionStage.disconnected;
+          _connectionStage = manual
+              ? ConnectionStage.stopped
+              : ConnectionStage.disconnected;
         }
         if (manual) {
           _recordLog('Disconnect requested by user');
@@ -1036,7 +1300,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     final timestamp = at ?? DateTime.now();
     final previous = _lastSessionActivityAt;
     _lastSessionActivityAt = timestamp;
-    if (previous == null || timestamp.difference(previous) >= const Duration(seconds: 5)) {
+    if (previous == null ||
+        timestamp.difference(previous) >= const Duration(seconds: 5)) {
       _recordLog('Health activity: $reason');
     }
   }
@@ -1055,19 +1320,20 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       final threshold = _hasRenderedFrame
           ? (_useRelayMode ? _relayHealthTimeout : _directHealthTimeout)
           : _startupHealthTimeout;
-      final baselineAt = <DateTime?>[
-        _lastVideoPacketAt,
-        if (_settings.audioEnabled) _lastAudioPacketAt,
-        _lastFrameAt,
-        _lastControlAt,
-        _lastSessionActivityAt,
-        _connectStartedAt,
-      ].whereType<DateTime>().fold<DateTime?>(null, (latest, value) {
-        if (latest == null || value.isAfter(latest)) {
-          return value;
-        }
-        return latest;
-      });
+      final baselineAt =
+          <DateTime?>[
+            _lastVideoPacketAt,
+            if (_settings.audioEnabled) _lastAudioPacketAt,
+            _lastFrameAt,
+            _lastControlAt,
+            _lastSessionActivityAt,
+            _connectStartedAt,
+          ].whereType<DateTime>().fold<DateTime?>(null, (latest, value) {
+            if (latest == null || value.isAfter(latest)) {
+              return value;
+            }
+            return latest;
+          });
       if (baselineAt == null) {
         return;
       }
@@ -1078,10 +1344,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         return;
       }
 
-      final videoAge = _lastVideoPacketAt == null ? null : now.difference(_lastVideoPacketAt!);
-      final audioAge = _lastAudioPacketAt == null ? null : now.difference(_lastAudioPacketAt!);
-      final renderAge = _lastFrameAt == null ? null : now.difference(_lastFrameAt!);
-      final controlAge = _lastControlAt == null ? null : now.difference(_lastControlAt!);
+      final videoAge = _lastVideoPacketAt == null
+          ? null
+          : now.difference(_lastVideoPacketAt!);
+      final audioAge = _lastAudioPacketAt == null
+          ? null
+          : now.difference(_lastAudioPacketAt!);
+      final renderAge = _lastFrameAt == null
+          ? null
+          : now.difference(_lastFrameAt!);
+      final controlAge = _lastControlAt == null
+          ? null
+          : now.difference(_lastControlAt!);
       _recordLog(
         'Health decision: stale=true phase=${_streamPhase.name} idle=${idleFor.inSeconds}s videoAge=${videoAge?.inSeconds ?? -1}s audioAge=${audioAge?.inSeconds ?? -1}s renderAge=${renderAge?.inSeconds ?? -1}s controlAge=${controlAge?.inSeconds ?? -1}s',
       );
@@ -1117,7 +1391,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           'Health timeout fired after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s), requesting resync (phase=${_streamPhase.name})',
         );
         try {
-          await _requestResyncWithGuard('health timeout after ${idleFor.inSeconds}s');
+          await _requestResyncWithGuard(
+            'health timeout after ${idleFor.inSeconds}s',
+          );
         } catch (err) {
           if (!mounted) {
             return;
@@ -1142,7 +1418,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _connectionStage == ConnectionStage.tlsFailed) {
       return;
     }
-    unawaited(Future<void>.delayed(Duration.zero, () => _scheduleReconnect(reason: reason)));
+    unawaited(
+      Future<void>.delayed(
+        Duration.zero,
+        () => _scheduleReconnect(reason: reason),
+      ),
+    );
   }
 
   Future<void> _scheduleReconnect({required String reason}) async {
@@ -1152,7 +1433,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     if (_reconnectAttempt >= _reconnectBackoffSeconds.length) {
       if (mounted) {
         setState(() {
-          _message = 'Auto reconnect stopped after ${_reconnectBackoffSeconds.length} attempts.';
+          _message =
+              'Auto reconnect stopped after ${_reconnectBackoffSeconds.length} attempts.';
           _connectionStage = ConnectionStage.disconnected;
         });
       }
@@ -1167,7 +1449,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _connectionStage = ConnectionStage.reconnecting;
         _message =
             'Reconnect attempt $_reconnectAttempt/${_reconnectBackoffSeconds.length} in ${delaySeconds}s ($reason)';
-        _recordLog('Reconnect attempt $_reconnectAttempt scheduled in ${delaySeconds}s ($reason)');
+        _recordLog(
+          'Reconnect attempt $_reconnectAttempt scheduled in ${delaySeconds}s ($reason)',
+        );
       });
     }
     await _disconnect();
@@ -1202,7 +1486,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         setState(() {
           _message = 'Settings applied.';
           _recordLog(
-            'Settings applied: monitor ${_settings.monitorIndex}, ${_settings.targetWidth}px, ${_settings.fps} FPS, JPEG ${_settings.jpegQuality.round()}, view-only=${_settings.viewOnly}, clipboard=manual, delta=${_settings.deltaStreamEnabled}, audio=${_settings.audioEnabled}',
+            'Settings applied: monitor ${_settings.monitorIndex}, ${_settings.targetWidth}px, ${_settings.fps} FPS, JPEG ${_settings.jpegQuality.round()}, view-only=${_settings.viewOnly}, clipboard=manual, delta=${_settings.deltaStreamEnabled}, audio=${_settings.audioEnabled || kDebugAudioOnlyMode}',
           );
         });
       }
@@ -1302,7 +1586,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
     if (file.bytes!.length > _maxTransferBytes) {
       setState(() {
-        _message = 'File too large. Max size is ${(_maxTransferBytes / (1024 * 1024)).round()} MB.';
+        _message =
+            'File too large. Max size is ${(_maxTransferBytes / (1024 * 1024)).round()} MB.';
         _transferStatus = 'Transfer blocked';
         _transferProgress = null;
       });
@@ -1314,7 +1599,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _transferCancelled = false;
         _transferProgress = 0;
         _transferStatus = 'Sending ${file.name}...';
-        _recordLog('File transfer started: ${file.name} (${file.bytes!.length} bytes)');
+        _recordLog(
+          'File transfer started: ${file.name} (${file.bytes!.length} bytes)',
+        );
       });
       await client.sendFileBytes(
         file.name,
@@ -1325,7 +1612,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           }
           setState(() {
             _transferProgress = progress;
-            _transferStatus = 'Sending ${file.name} (${(progress * 100).round()}%)';
+            _transferStatus =
+                'Sending ${file.name} (${(progress * 100).round()}%)';
           });
         },
         shouldCancel: () => _transferCancelled,
@@ -1353,14 +1641,29 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     });
   }
 
-  Future<void> _handleLongPressStart(LongPressStartDetails details, BoxConstraints constraints) async {
+  Future<void> _handleLongPressStart(
+    LongPressStartDetails details,
+    BoxConstraints constraints,
+  ) async {
     final client = _remoteClient;
     if (client == null || _localViewOnly || _settings.viewOnly) {
       return;
     }
-
-    final relX = (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
-    final relY = (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+    final frameSize = _framePresenter.frameSizeListenable.value;
+    if (frameSize == null) {
+      return;
+    }
+    final normalized = _localToRemoteNormalized(
+      details.localPosition,
+      constraints,
+      frameSize,
+    );
+    if (normalized == null) {
+      return;
+    }
+    final relX = normalized.dx;
+    final relY = normalized.dy;
+    _updateCursorNormalized(normalized);
     unawaited(() async {
       try {
         await client.sendMouseMove(relX, relY);
@@ -1373,14 +1676,27 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   void _handlePointerDown(Offset localPosition, BoxConstraints constraints) {
     final client = _remoteClient;
-    if (client == null || _localViewOnly || _settings.viewOnly) {
+    final frameSize = _framePresenter.frameSizeListenable.value;
+    if (client == null ||
+        _localViewOnly ||
+        _settings.viewOnly ||
+        frameSize == null) {
       return;
     }
 
     _pointerDownPosition = localPosition;
     _pointerMovedSinceDown = false;
-    final relX = (localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
-    final relY = (localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+    final normalized = _localToRemoteNormalized(
+      localPosition,
+      constraints,
+      frameSize,
+    );
+    if (normalized == null) {
+      return;
+    }
+    final relX = normalized.dx;
+    final relY = normalized.dy;
+    _updateCursorNormalized(normalized);
     _recordLog(
       'touch down local=(${localPosition.dx.toStringAsFixed(1)}, ${localPosition.dy.toStringAsFixed(1)}) '
       'size=(${constraints.maxWidth.toStringAsFixed(1)}, ${constraints.maxHeight.toStringAsFixed(1)}) '
@@ -1397,17 +1713,32 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   void _handlePointerMove(Offset localPosition, BoxConstraints constraints) {
     final client = _remoteClient;
-    if (client == null || _localViewOnly || _settings.viewOnly) {
+    final frameSize = _framePresenter.frameSizeListenable.value;
+    if (client == null ||
+        _localViewOnly ||
+        _settings.viewOnly ||
+        frameSize == null ||
+        _activePointerCount > 1) {
       return;
     }
 
     final down = _pointerDownPosition;
-    if (down != null && (localPosition - down).distanceSquared > _tapSlopSquared) {
+    if (down != null &&
+        (localPosition - down).distanceSquared > _tapSlopSquared) {
       _pointerMovedSinceDown = true;
     }
 
-    final relX = (localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
-    final relY = (localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+    final normalized = _localToRemoteNormalized(
+      localPosition,
+      constraints,
+      frameSize,
+    );
+    if (normalized == null) {
+      return;
+    }
+    final relX = normalized.dx;
+    final relY = normalized.dy;
+    _updateCursorNormalized(normalized);
     unawaited(() async {
       try {
         await client.sendMouseMove(relX, relY);
@@ -1419,12 +1750,25 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   void _handlePointerUp(Offset localPosition, BoxConstraints constraints) {
     final client = _remoteClient;
-    if (client == null || _localViewOnly || _settings.viewOnly) {
+    final frameSize = _framePresenter.frameSizeListenable.value;
+    if (client == null ||
+        _localViewOnly ||
+        _settings.viewOnly ||
+        frameSize == null) {
       return;
     }
 
-    final relX = (localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
-    final relY = (localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+    final normalized = _localToRemoteNormalized(
+      localPosition,
+      constraints,
+      frameSize,
+    );
+    if (normalized == null) {
+      return;
+    }
+    final relX = normalized.dx;
+    final relY = normalized.dy;
+    _updateCursorNormalized(normalized);
     final shouldClick = !_pointerMovedSinceDown;
     _recordLog(
       'touch up rel=(${relX.toStringAsFixed(3)}, ${relY.toStringAsFixed(3)}) click=$shouldClick',
@@ -1434,7 +1778,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     unawaited(() async {
       try {
         if (shouldClick) {
-          _recordLog('sending left_click rel=(${relX.toStringAsFixed(3)}, ${relY.toStringAsFixed(3)})');
+          _recordLog(
+            'sending left_click rel=(${relX.toStringAsFixed(3)}, ${relY.toStringAsFixed(3)})',
+          );
           await client.sendLeftClick();
         } else {
           await client.sendMouseMove(relX, relY);
@@ -1444,6 +1790,54 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         debugPrint('pointer up send failed: $e');
       }
     }());
+  }
+
+  void _handleScaleStart(ScaleStartDetails details) {
+    _scaleStartViewportScale = _viewportScale;
+    _scaleStartViewportPan = _viewportPan;
+    _scaleStartFocalPoint = details.localFocalPoint;
+  }
+
+  void _handleScaleUpdate(
+    ScaleUpdateDetails details,
+    BoxConstraints constraints,
+  ) {
+    final frameSize = _framePresenter.frameSizeListenable.value;
+    if (frameSize == null) {
+      return;
+    }
+    if (details.pointerCount <= 1 && _viewportScale <= 1.0) {
+      return;
+    }
+    final baseScale = _scaleStartViewportScale;
+    final nextScale = (baseScale * details.scale).clamp(
+      _minViewportScale,
+      _maxViewportScale,
+    );
+    final focalStart = _scaleStartFocalPoint ?? details.localFocalPoint;
+    final panDelta = details.localFocalPoint - focalStart;
+    final layoutBase = _computeViewportLayout(constraints, frameSize);
+    if (layoutBase == null) {
+      return;
+    }
+    final nextScaledSize = Size(
+      layoutBase.baseSize.width * nextScale,
+      layoutBase.baseSize.height * nextScale,
+    );
+    setState(() {
+      _viewportScale = nextScale;
+      _viewportPan = _clampViewportPan(
+        constraints,
+        nextScaledSize,
+        _scaleStartViewportPan + panDelta,
+      );
+    });
+  }
+
+  void _handleScaleEnd(ScaleEndDetails details) {
+    if (_viewportScale <= 1.01) {
+      _resetViewportTransform();
+    }
   }
 
   Future<void> _sendScroll(int delta) async {
@@ -1561,9 +1955,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   Future<void> _openKeyboardDialog() async {
     final result = await Navigator.of(context).push<String>(
-      MaterialPageRoute(
-        builder: (_) => const _KeyboardInputPage(),
-      ),
+      MaterialPageRoute(builder: (_) => const _KeyboardInputPage()),
     );
 
     if (!mounted || result == null || result == 'cancel') {
@@ -1621,7 +2013,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
-
   void _handleControlMessage(Map<String, dynamic> message) {
     if (!mounted) {
       return;
@@ -1630,7 +2021,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _lastControlAt = DateTime.now();
     _markSessionActivity('control:$type');
     if (type == 'monitor_inventory') {
-      final monitors = (message['monitors'] as List<dynamic>? ?? const <dynamic>[]);
+      final monitors =
+          (message['monitors'] as List<dynamic>? ?? const <dynamic>[]);
       final indexes = <int>[];
       final labels = <int, String>{};
       for (final item in monitors) {
@@ -1643,7 +2035,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         labels[index] = (map['label'] as String?) ?? 'Monitor $index';
       }
       setState(() {
-        _availableMonitorIndexes = indexes.isEmpty ? const <int>[0, 1, 2, 3] : indexes;
+        _availableMonitorIndexes = indexes.isEmpty
+            ? const <int>[0, 1, 2, 3]
+            : indexes;
         _monitorLabels = labels;
         if (!_availableMonitorIndexes.contains(_settings.monitorIndex)) {
           _settings.monitorIndex = _availableMonitorIndexes.first;
@@ -1700,18 +2094,33 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
     if (type == 'stream_stats') {
       setState(() {
-        _streamKeyframesSent = (message['keyframes_sent'] as num?)?.toInt() ?? _streamKeyframesSent;
-        _streamDeltaFramesSent = (message['delta_frames_sent'] as num?)?.toInt() ?? _streamDeltaFramesSent;
-        _streamResyncRequests = (message['resync_requests'] as num?)?.toInt() ?? _streamResyncRequests;
-        _streamInferredMoveFrames = (message['inferred_move_frames'] as num?)?.toInt() ?? _streamInferredMoveFrames;
-        _streamLastPatchCount = (message['last_patch_count'] as num?)?.toInt() ?? _streamLastPatchCount;
-        _streamLastMoveCount = (message['last_move_count'] as num?)?.toInt() ?? _streamLastMoveCount;
-        _streamLastChangedRatio = (message['last_changed_ratio'] as num?)?.toDouble() ?? _streamLastChangedRatio;
+        _streamKeyframesSent =
+            (message['keyframes_sent'] as num?)?.toInt() ??
+            _streamKeyframesSent;
+        _streamDeltaFramesSent =
+            (message['delta_frames_sent'] as num?)?.toInt() ??
+            _streamDeltaFramesSent;
+        _streamResyncRequests =
+            (message['resync_requests'] as num?)?.toInt() ??
+            _streamResyncRequests;
+        _streamInferredMoveFrames =
+            (message['inferred_move_frames'] as num?)?.toInt() ??
+            _streamInferredMoveFrames;
+        _streamLastPatchCount =
+            (message['last_patch_count'] as num?)?.toInt() ??
+            _streamLastPatchCount;
+        _streamLastMoveCount =
+            (message['last_move_count'] as num?)?.toInt() ??
+            _streamLastMoveCount;
+        _streamLastChangedRatio =
+            (message['last_changed_ratio'] as num?)?.toDouble() ??
+            _streamLastChangedRatio;
         _streamVideoFramesReplacedBeforeSend =
             (message['video_frames_replaced_before_send'] as num?)?.toInt() ??
             _streamVideoFramesReplacedBeforeSend;
         _streamAudioPacketsSent =
-            (message['audio_packets_sent'] as num?)?.toInt() ?? _streamAudioPacketsSent;
+            (message['audio_packets_sent'] as num?)?.toInt() ??
+            _streamAudioPacketsSent;
       });
       return;
     }
@@ -1736,6 +2145,27 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return;
     }
 
+    if (type == 'client_transport_latency_summary') {
+      _recordLog(
+        'Transport summary: dispatch_avg=${message['dispatch_avg_ms']}ms dispatch_p95=${message['dispatch_p95_ms']}ms',
+      );
+      return;
+    }
+
+    if (type == 'client_video_latency_summary') {
+      _recordLog(
+        'Video decode summary: receive_to_decode_start_avg=${message['receive_to_decode_start_avg_ms']}ms p95=${message['receive_to_decode_start_p95_ms']}ms decode_avg=${message['decode_avg_ms']}ms p95=${message['decode_p95_ms']}ms receive_to_emit_avg=${message['receive_to_emit_avg_ms']}ms p95=${message['receive_to_emit_p95_ms']}ms replaced_before_decode=${message['frames_replaced_before_decode']} stale_drops_after_decode=${message['stale_drops_after_decode']} decode_bypass_frames=${message['decode_bypass_frames']}',
+      );
+      return;
+    }
+
+    if (type == 'client_audio_latency_summary') {
+      _recordLog(
+        'Audio summary: receive_to_submit_avg=${message['receive_to_audio_submit_avg_ms']}ms p95=${message['receive_to_audio_submit_p95_ms']}ms queue_depth_avg=${message['audio_queue_depth_avg']} p95=${message['audio_queue_depth_p95']} late_drops=${message['audio_late_drop_count']} buffer_occ_avg=${message['audio_buffer_occupancy_avg_ms']}ms p95=${message['audio_buffer_occupancy_p95_ms']}ms target=${message['audio_queue_target_ms']}ms',
+      );
+      return;
+    }
+
     if (type == 'clipboard_data') {
       final text = message['text'] as String? ?? '';
       final syncId = message['sync_id'] as String?;
@@ -1747,12 +2177,20 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _hostClipboardText = text;
         _message = text.isEmpty
             ? 'Host clipboard is empty.'
-            : (appliedLocally ? 'Clipboard updated from PC.' : 'Clipboard received from PC.');
-        _recordLog('Received host clipboard (${text.length} chars, sync=${syncId ?? 'none'}, auto=$appliedLocally)');
+            : (appliedLocally
+                  ? 'Clipboard updated from PC.'
+                  : 'Clipboard received from PC.');
+        _recordLog(
+          'Received host clipboard (${text.length} chars, sync=${syncId ?? 'none'}, auto=$appliedLocally)',
+        );
       });
-      _showSnack(text.isEmpty
-          ? 'Clipboard empty'
-          : (appliedLocally ? 'Clipboard updated from PC' : 'Clipboard received from PC'));
+      _showSnack(
+        text.isEmpty
+            ? 'Clipboard empty'
+            : (appliedLocally
+                  ? 'Clipboard updated from PC'
+                  : 'Clipboard received from PC'),
+      );
       return;
     }
 
@@ -1788,13 +2226,21 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _recordLog('Pair result: ok=$ok, message=$resultMessage');
       });
       unawaited(_persistClientPrefs());
-      _showSnack(ok ? 'Trusted successfully' : (_trustState == TrustState.pending ? 'Waiting for host approval' : _message ?? 'Pairing failed'));
+      _showSnack(
+        ok
+            ? 'Trusted successfully'
+            : (_trustState == TrustState.pending
+                  ? 'Waiting for host approval'
+                  : _message ?? 'Pairing failed'),
+      );
       return;
     }
 
     if (type == 'trusted_auth_sent') {
       setState(() {
-        _recordLog('Trusted auth sent for device ${message['device_id'] ?? 'unknown'}');
+        _recordLog(
+          'Trusted auth sent for device ${message['device_id'] ?? 'unknown'}',
+        );
       });
       return;
     }
@@ -1802,7 +2248,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     if (type == 'trusted_auth_result') {
       final ok = message['ok'] == true;
       final revoked = message['revoked'] == true;
-      final resultMessage = message['message'] as String? ?? 'trusted_auth_result';
+      final resultMessage =
+          message['message'] as String? ?? 'trusted_auth_result';
       _remoteClient?.setTrustedAuthEnabled(ok);
       setState(() {
         if (ok) {
@@ -1839,8 +2286,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       final percent = (message['progress_percent'] as num?)?.toDouble();
       final filename = message['filename'] as String? ?? 'file';
       setState(() {
-        _transferProgress = percent == null ? null : (percent / 100.0).clamp(0.0, 1.0);
-        _transferStatus = percent == null ? 'Receiving $filename...' : 'Receiving $filename (${percent.round()}%)';
+        _transferProgress = percent == null
+            ? null
+            : (percent / 100.0).clamp(0.0, 1.0);
+        _transferStatus = percent == null
+            ? 'Receiving $filename...'
+            : 'Receiving $filename (${percent.round()}%)';
       });
       return;
     }
@@ -1858,9 +2309,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _message = success
             ? 'Host saved $filename${savedPath == null ? '' : ' -> $savedPath'}'
             : 'Host rejected file: ${error ?? filename}';
-        _recordLog(success
-            ? 'Host saved $filename${savedPath == null ? '' : ' -> $savedPath'}'
-            : 'Host rejected file: ${error ?? filename}');
+        _recordLog(
+          success
+              ? 'Host saved $filename${savedPath == null ? '' : ' -> $savedPath'}'
+              : 'Host rejected file: ${error ?? filename}',
+        );
       });
       return;
     }
@@ -1879,7 +2332,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     if (text.contains('handshake') || text.contains('tls')) {
       return ConnectionStage.tlsFailed;
     }
-    if (text.contains('auth') || text.contains('token mismatch') || text.contains('not authenticated')) {
+    if (text.contains('auth') ||
+        text.contains('token mismatch') ||
+        text.contains('not authenticated')) {
       return ConnectionStage.authFailed;
     }
     return ConnectionStage.error;
@@ -1941,8 +2396,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
-    final frameHeight = (media.size.height * 0.4).clamp(180.0, 420.0).toDouble();
-    final landscapeFullscreen = media.orientation == Orientation.landscape && _hasRenderedFrame;
+    final frameHeight = (media.size.height * 0.4)
+        .clamp(180.0, 420.0)
+        .toDouble();
+    final landscapeFullscreen =
+        media.orientation == Orientation.landscape && _hasRenderedFrame;
 
     if (landscapeFullscreen) {
       return Scaffold(
@@ -1962,43 +2420,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 ),
               ),
             ),
-            Positioned(
-              top: 12,
-              left: 12,
-              right: 12,
-              child: SafeArea(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.65),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            _useRelayMode
-                                ? 'Relay ${_hostController.text.trim()}:${_portController.text.trim()}'
-                                : 'Direct ${_hostController.text.trim()}:${_portController.text.trim()}',
-                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Text(
-                          _stageLabel(_connectionStage),
-                          style: TextStyle(
-                            color: _connected ? Colors.lightGreenAccent : Colors.orangeAccent,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
           ],
         ),
       );
@@ -2009,12 +2430,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         title: const Text('AetherLink'),
         actions: [
           IconButton(
-            icon: Icon(_localViewOnly ? Icons.visibility_off : Icons.visibility),
-            tooltip: _localViewOnly ? 'Local view-only enabled' : 'Local view-only disabled',
+            icon: Icon(
+              _localViewOnly ? Icons.visibility_off : Icons.visibility,
+            ),
+            tooltip: _localViewOnly
+                ? 'Local view-only enabled'
+                : 'Local view-only disabled',
             onPressed: () {
               setState(() {
                 _localViewOnly = !_localViewOnly;
-                _message = _localViewOnly ? 'Local view-only enabled.' : 'Local view-only disabled.';
+                _message = _localViewOnly
+                    ? 'Local view-only enabled.'
+                    : 'Local view-only disabled.';
               });
             },
           ),
@@ -2027,7 +2454,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       ),
       body: SafeArea(
         child: ListView(
-          padding: EdgeInsets.fromLTRB(16, 16, 16, 120 + media.viewInsets.bottom),
+          padding: EdgeInsets.fromLTRB(
+            16,
+            16,
+            16,
+            120 + media.viewInsets.bottom,
+          ),
           children: [
             _buildConnectionSummary(),
             const SizedBox(height: 12),
@@ -2098,13 +2530,19 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 Expanded(
                   child: ElevatedButton(
                     onPressed: _connecting ? null : _connectAndStream,
-                    child: Text(_connecting ? 'Connecting...' : (_connected ? 'Reconnect' : 'Connect')),
+                    child: Text(
+                      _connecting
+                          ? 'Connecting...'
+                          : (_connected ? 'Reconnect' : 'Connect'),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _connected ? () => _disconnect(manual: true) : null,
+                    onPressed: _connected
+                        ? () => _disconnect(manual: true)
+                        : null,
                     child: const Text('Disconnect'),
                   ),
                 ),
@@ -2147,14 +2585,20 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(_transferStatus!, style: const TextStyle(fontWeight: FontWeight.bold)),
+                      Text(
+                        _transferStatus!,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
                       if (_transferProgress != null) ...[
                         const SizedBox(height: 8),
                         LinearProgressIndicator(value: _transferProgress),
                       ],
                       const SizedBox(height: 8),
                       ElevatedButton(
-                        onPressed: (_transferProgress != null && _transferProgress! < 1.0 && !_transferCancelled)
+                        onPressed:
+                            (_transferProgress != null &&
+                                _transferProgress! < 1.0 &&
+                                !_transferCancelled)
                             ? _cancelTransfer
                             : null,
                         child: const Text('Cancel Transfer'),
@@ -2168,7 +2612,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               Text(
                 _message!,
                 style: TextStyle(
-                  color: _message!.toLowerCase().contains('failed') || _message!.toLowerCase().contains('error')
+                  color:
+                      _message!.toLowerCase().contains('failed') ||
+                          _message!.toLowerCase().contains('error')
                       ? Colors.red
                       : Colors.green.shade700,
                 ),
@@ -2198,12 +2644,35 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       builder: (context, imageConstraints) {
         return Listener(
           behavior: HitTestBehavior.opaque,
-          onPointerDown: (event) => _handlePointerDown(event.localPosition, imageConstraints),
-          onPointerMove: (event) => _handlePointerMove(event.localPosition, imageConstraints),
-          onPointerUp: (event) => _handlePointerUp(event.localPosition, imageConstraints),
+          onPointerDown: (event) {
+            _activePointerCount += 1;
+            if (_activePointerCount == 1) {
+              _handlePointerDown(event.localPosition, imageConstraints);
+            }
+          },
+          onPointerMove: (event) =>
+              _handlePointerMove(event.localPosition, imageConstraints),
+          onPointerUp: (event) {
+            _activePointerCount = math.max(0, _activePointerCount - 1);
+            if (_activePointerCount == 0) {
+              _handlePointerUp(event.localPosition, imageConstraints);
+            }
+          },
+          onPointerCancel: (_) {
+            _activePointerCount = math.max(0, _activePointerCount - 1);
+            if (_activePointerCount == 0) {
+              _pointerDownPosition = null;
+              _pointerMovedSinceDown = false;
+            }
+          },
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
-            onLongPressStart: (details) => _handleLongPressStart(details, imageConstraints),
+            onLongPressStart: (details) =>
+                _handleLongPressStart(details, imageConstraints),
+            onScaleStart: _handleScaleStart,
+            onScaleUpdate: (details) =>
+                _handleScaleUpdate(details, imageConstraints),
+            onScaleEnd: _handleScaleEnd,
             child: DecoratedBox(
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.black26),
@@ -2218,30 +2687,174 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                       return ValueListenableBuilder<Size?>(
                         valueListenable: _framePresenter.frameSizeListenable,
                         builder: (context, frameSize, _) {
-                          if (image == null || frameSize == null || frameSize.width <= 0 || frameSize.height <= 0) {
-                            return const SizedBox.expand();
-                          }
-                          final viewportSignature =
-                              '${frameSize.width.toInt()}x${frameSize.height.toInt()}|${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)}|${MediaQuery.of(context).orientation.name}';
-                          if (_lastViewportSignature != viewportSignature) {
-                            _lastViewportSignature = viewportSignature;
-                            _recordLog(
-                              'Render viewport: frame=${frameSize.width.toInt()}x${frameSize.height.toInt()} constraints=${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)} fit=contain orientation=${MediaQuery.of(context).orientation.name}',
-                            );
-                          }
-                          return Center(
-                            child: FittedBox(
-                              fit: BoxFit.contain,
-                              child: SizedBox(
-                                width: frameSize.width,
-                                height: frameSize.height,
-                                child: RawImage(
-                                  image: image,
-                                  fit: BoxFit.contain,
-                                  filterQuality: FilterQuality.none,
-                                ),
-                              ),
-                            ),
+                          _videoWidgetBuildCount += 1;
+                          return ValueListenableBuilder<String?>(
+                            valueListenable:
+                                _framePresenter.placeholderTextListenable,
+                            builder: (context, placeholderText, _) {
+                              if (placeholderText != null) {
+                                return DecoratedBox(
+                                  decoration: const BoxDecoration(
+                                    color: Colors.black87,
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      placeholderText,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ),
+                                );
+                              }
+                              if (image == null ||
+                                  frameSize == null ||
+                                  frameSize.width <= 0 ||
+                                  frameSize.height <= 0) {
+                                return const SizedBox.expand();
+                              }
+                              final viewportSignature =
+                                  '${frameSize.width.toInt()}x${frameSize.height.toInt()}|${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)}|${MediaQuery.of(context).orientation.name}';
+                              if (_lastViewportSignature != viewportSignature) {
+                                _lastViewportSignature = viewportSignature;
+                                _recordLog(
+                                  'Render viewport: frame=${frameSize.width.toInt()}x${frameSize.height.toInt()} constraints=${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)} fit=contain orientation=${MediaQuery.of(context).orientation.name}',
+                                );
+                              }
+                              final layout = _computeViewportLayout(
+                                imageConstraints,
+                                frameSize,
+                              );
+                              if (layout == null) {
+                                return const SizedBox.expand();
+                              }
+                              final cursor = _cursorNormalizedPosition;
+                              return Stack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  Positioned.fromRect(
+                                    rect: layout.imageRect,
+                                    child: SizedBox(
+                                      width: layout.imageRect.width,
+                                      height: layout.imageRect.height,
+                                      child: RawImage(
+                                        image: image,
+                                        fit: fit,
+                                        filterQuality: FilterQuality.none,
+                                      ),
+                                    ),
+                                  ),
+                                  if (cursor != null)
+                                    Positioned(
+                                      left:
+                                          layout.imageRect.left +
+                                          (cursor.dx * layout.imageRect.width) -
+                                          10,
+                                      top:
+                                          layout.imageRect.top +
+                                          (cursor.dy *
+                                              layout.imageRect.height) -
+                                          10,
+                                      child: IgnorePointer(
+                                        child: Icon(
+                                          Icons.navigation,
+                                          size: 22,
+                                          color:
+                                              Colors.lightGreenAccent.shade400,
+                                          shadows: const [
+                                            Shadow(
+                                              color: Colors.black87,
+                                              blurRadius: 4,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  Positioned(
+                                    top: 8,
+                                    right: 8,
+                                    child: DecoratedBox(
+                                      decoration: BoxDecoration(
+                                        color: Colors.black.withValues(
+                                          alpha: 0.55,
+                                        ),
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 4,
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            IconButton(
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                              constraints:
+                                                  const BoxConstraints.tightFor(
+                                                    width: 32,
+                                                    height: 32,
+                                                  ),
+                                              padding: EdgeInsets.zero,
+                                              onPressed: () =>
+                                                  setState(() => _zoomBy(0.85)),
+                                              icon: const Icon(
+                                                Icons.remove,
+                                                color: Colors.white,
+                                              ),
+                                              tooltip: 'Zoom out',
+                                            ),
+                                            Text(
+                                              '${(_viewportScale * 100).round()}%',
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                            IconButton(
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                              constraints:
+                                                  const BoxConstraints.tightFor(
+                                                    width: 32,
+                                                    height: 32,
+                                                  ),
+                                              padding: EdgeInsets.zero,
+                                              onPressed: () =>
+                                                  setState(() => _zoomBy(1.15)),
+                                              icon: const Icon(
+                                                Icons.add,
+                                                color: Colors.white,
+                                              ),
+                                              tooltip: 'Zoom in',
+                                            ),
+                                            IconButton(
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                              constraints:
+                                                  const BoxConstraints.tightFor(
+                                                    width: 32,
+                                                    height: 32,
+                                                  ),
+                                              padding: EdgeInsets.zero,
+                                              onPressed:
+                                                  _resetViewportTransform,
+                                              icon: const Icon(
+                                                Icons.center_focus_strong,
+                                                color: Colors.white,
+                                              ),
+                                              tooltip: 'Reset view',
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
                           );
                         },
                       );
@@ -2263,8 +2876,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       ConnectionStage.tlsHandshake ||
       ConnectionStage.authenticating ||
       ConnectionStage.reconnecting => Colors.orange.shade700,
-      ConnectionStage.authFailed || ConnectionStage.tlsFailed || ConnectionStage.error => Colors.red.shade700,
-      ConnectionStage.disconnected || ConnectionStage.idle || ConnectionStage.stopped => Colors.grey.shade700,
+      ConnectionStage.authFailed ||
+      ConnectionStage.tlsFailed ||
+      ConnectionStage.error => Colors.red.shade700,
+      ConnectionStage.disconnected ||
+      ConnectionStage.idle ||
+      ConnectionStage.stopped => Colors.grey.shade700,
     };
     final text = _stageLabel(_connectionStage);
     return Row(
@@ -2273,7 +2890,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         const SizedBox(width: 8),
         Expanded(
           child: Text(
-            _hasRenderedFrame ? '$text, frame age ${_lastRenderedFrameAgeMs}ms' : text,
+            _hasRenderedFrame
+                ? '$text, frame age ${_lastRenderedFrameAgeMs}ms'
+                : text,
             style: TextStyle(fontWeight: FontWeight.bold, color: color),
           ),
         ),
@@ -2288,23 +2907,47 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Diagnostics', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Diagnostics',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
-            Text('Host: ${_hostController.text.trim().isEmpty ? '-' : _hostController.text.trim()}'),
-            Text('Port: ${_portController.text.trim().isEmpty ? '-' : _portController.text.trim()}'),
+            Text(
+              'Host: ${_hostController.text.trim().isEmpty ? '-' : _hostController.text.trim()}',
+            ),
+            Text(
+              'Port: ${_portController.text.trim().isEmpty ? '-' : _portController.text.trim()}',
+            ),
             Text('Transport: ${_useRelayMode ? 'relay' : 'direct'}'),
-            if (_useRelayMode) Text('Relay host ID: ${_relayHostIdController.text.trim().isEmpty ? '-' : _relayHostIdController.text.trim()}'),
+            if (_useRelayMode)
+              Text(
+                'Relay host ID: ${_relayHostIdController.text.trim().isEmpty ? '-' : _relayHostIdController.text.trim()}',
+              ),
             Text('State: ${_stageLabel(_connectionStage)}'),
             Text('Monitor: ${_settings.monitorIndex}'),
             if (_monitorLabels.isNotEmpty)
               Text('Host monitors: ${_monitorLabels.values.join(' | ')}'),
-            Text('Settings: ${_settings.targetWidth}px, ${_settings.fps} FPS, JPEG ${_settings.jpegQuality.round()}, view-only=${_settings.viewOnly}, clipboard=${_clipboardModeToWire(_settings.clipboardMode)}, delta=${_settings.deltaStreamEnabled}, audio=${_settings.audioEnabled}'),
-            Text('Trust: ${_trustStateLabel(_trustState)}${_trustedDeviceId == null ? '' : ' (${_truncate(_trustedDeviceId!, 18)})'}'),
+            Text(
+              'Settings: ${_settings.targetWidth}px, ${_settings.fps} FPS, JPEG ${_settings.jpegQuality.round()}, view-only=${_settings.viewOnly}, clipboard=${_clipboardModeToWire(_settings.clipboardMode)}, delta=${_settings.deltaStreamEnabled}, audio=${_settings.audioEnabled}',
+            ),
+            Text(
+              'Debug modes: video_disabled=$kDebugVideoDisabled audio_disabled=$kDebugAudioDisabled decode_bypass=$kDebugVideoDecodeBypass audio_only=$kDebugAudioOnlyMode',
+            ),
+            Text(
+              'Trust: ${_trustStateLabel(_trustState)}${_trustedDeviceId == null ? '' : ' (${_truncate(_trustedDeviceId!, 18)})'}',
+            ),
             Text('Auto reconnect: ${_autoReconnectEnabled ? 'on' : 'off'}'),
-            Text('Reconnect attempts: $_reconnectAttempt/${_reconnectBackoffSeconds.length}'),
-            Text('Stream stats: keyframes=$_streamKeyframesSent deltas=$_streamDeltaFramesSent resyncs=$_streamResyncRequests video_replaced=$_streamVideoFramesReplacedBeforeSend audio_sent=$_streamAudioPacketsSent'),
-            Text('Last delta stats: moves=$_streamLastMoveCount patches=$_streamLastPatchCount changed=${(_streamLastChangedRatio * 100).toStringAsFixed(1)}%'),
-            if (_hostClipboardText != null) Text('Host clipboard: ${_truncate(_hostClipboardText!, 60)}'),
+            Text(
+              'Reconnect attempts: $_reconnectAttempt/${_reconnectBackoffSeconds.length}',
+            ),
+            Text(
+              'Stream stats: keyframes=$_streamKeyframesSent deltas=$_streamDeltaFramesSent resyncs=$_streamResyncRequests video_replaced=$_streamVideoFramesReplacedBeforeSend audio_sent=$_streamAudioPacketsSent',
+            ),
+            Text(
+              'Last delta stats: moves=$_streamLastMoveCount patches=$_streamLastPatchCount changed=${(_streamLastChangedRatio * 100).toStringAsFixed(1)}%',
+            ),
+            if (_hostClipboardText != null)
+              Text('Host clipboard: ${_truncate(_hostClipboardText!, 60)}'),
             if (_lastError != null) Text('Last error: $_lastError'),
             const SizedBox(height: 8),
             SwitchListTile(
@@ -2322,7 +2965,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               children: [
                 ElevatedButton(
                   onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: _clientLogs.join('\n')));
+                    await Clipboard.setData(
+                      ClipboardData(text: _clientLogs.join('\n')),
+                    );
                     if (!mounted) {
                       return;
                     }
@@ -2358,7 +3003,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Saved Hosts', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Saved Hosts',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
             if (_loadingSavedHosts)
               const Text('Loading saved hosts...')
@@ -2376,7 +3024,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                     return ListTile(
                       dense: true,
                       selected: selected,
-                      leading: Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off),
+                      leading: Icon(
+                        selected
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_off,
+                      ),
                       title: Text(entry.label),
                       subtitle: Text(
                         '${entry.host}:${entry.port}${entry.useRelayMode ? '  relay:${entry.relayHostId}' : ''}',
@@ -2396,11 +3048,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   child: const Text('Save Current'),
                 ),
                 ElevatedButton(
-                  onPressed: _selectedSavedHostLabel == null ? null : () => _saveCurrentHost(updateExisting: true),
+                  onPressed: _selectedSavedHostLabel == null
+                      ? null
+                      : () => _saveCurrentHost(updateExisting: true),
                   child: const Text('Update'),
                 ),
                 OutlinedButton(
-                  onPressed: _selectedSavedHostLabel == null ? null : _deleteSelectedHost,
+                  onPressed: _selectedSavedHostLabel == null
+                      ? null
+                      : _deleteSelectedHost,
                   child: const Text('Delete'),
                 ),
               ],
@@ -2424,11 +3080,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Trust / Pairing', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Trust / Pairing',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
             Text('Device: $_trustedDeviceName'),
-            if (_trustedDeviceId != null) Text('Device ID: ${_truncate(_trustedDeviceId!, 32)}'),
-            Text('State: ${_trustStateLabel(_trustState)}', style: TextStyle(color: trustColor, fontWeight: FontWeight.bold)),
+            if (_trustedDeviceId != null)
+              Text('Device ID: ${_truncate(_trustedDeviceId!, 32)}'),
+            Text(
+              'State: ${_trustStateLabel(_trustState)}',
+              style: TextStyle(color: trustColor, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
@@ -2439,7 +3102,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   child: const Text('Pair this device'),
                 ),
                 ElevatedButton(
-                  onPressed: _connected ? () => _pairThisDevice(forceRePair: true) : null,
+                  onPressed: _connected
+                      ? () => _pairThisDevice(forceRePair: true)
+                      : null,
                   child: const Text('Re-pair'),
                 ),
                 OutlinedButton(
@@ -2461,15 +3126,31 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Session Settings', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Session Settings',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
             DropdownButtonFormField<ResolutionPreset>(
               initialValue: _settings.resolution,
               decoration: const InputDecoration(labelText: 'Resolution Preset'),
               items: const [
-                DropdownMenuItem(value: ResolutionPreset.low, child: Text('Responsive+ (720)')),
-                DropdownMenuItem(value: ResolutionPreset.medium, child: Text('Balanced (960)')),
-                DropdownMenuItem(value: ResolutionPreset.high, child: Text('Quality (1280)')),
+                DropdownMenuItem(
+                  value: ResolutionPreset.ultra,
+                  child: Text('Ultra Responsive (640)'),
+                ),
+                DropdownMenuItem(
+                  value: ResolutionPreset.low,
+                  child: Text('Responsive+ (720)'),
+                ),
+                DropdownMenuItem(
+                  value: ResolutionPreset.medium,
+                  child: Text('Balanced (960)'),
+                ),
+                DropdownMenuItem(
+                  value: ResolutionPreset.high,
+                  child: Text('Quality (1280)'),
+                ),
               ],
               onChanged: (value) {
                 if (value != null) {
@@ -2482,8 +3163,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             DropdownButtonFormField<int>(
               initialValue: _settings.fps,
               decoration: const InputDecoration(labelText: 'FPS'),
-              items: const [10, 12, 15, 20, 30]
-                  .map((v) => DropdownMenuItem<int>(value: v, child: Text('$v')))
+              items: const [8, 10, 12, 15, 20, 30]
+                  .map(
+                    (v) => DropdownMenuItem<int>(value: v, child: Text('$v')),
+                  )
                   .toList(),
               onChanged: (value) {
                 if (value != null) {
@@ -2497,10 +3180,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               initialValue: _settings.monitorIndex,
               decoration: const InputDecoration(labelText: 'Monitor Index'),
               items: _availableMonitorIndexes
-                  .map((v) => DropdownMenuItem<int>(
-                        value: v,
-                        child: Text(_monitorLabels[v] ?? 'Monitor $v'),
-                      ))
+                  .map(
+                    (v) => DropdownMenuItem<int>(
+                      value: v,
+                      child: Text(_monitorLabels[v] ?? 'Monitor $v'),
+                    ),
+                  )
                   .toList(),
               onChanged: (value) {
                 if (value != null) {
@@ -2540,10 +3225,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             ),
             DropdownButtonFormField<ClipboardSyncMode>(
               initialValue: _settings.clipboardMode,
-              decoration: const InputDecoration(labelText: 'Clipboard Sync Mode'),
+              decoration: const InputDecoration(
+                labelText: 'Clipboard Sync Mode',
+              ),
               items: const [
-                DropdownMenuItem(value: ClipboardSyncMode.manual, child: Text('Manual')),
-                DropdownMenuItem(value: ClipboardSyncMode.hostToClient, child: Text('Auto: Host to Client')),
+                DropdownMenuItem(
+                  value: ClipboardSyncMode.manual,
+                  child: Text('Manual'),
+                ),
+                DropdownMenuItem(
+                  value: ClipboardSyncMode.hostToClient,
+                  child: Text('Auto: Host to Client'),
+                ),
               ],
               onChanged: (value) {
                 if (value != null) {
@@ -2614,7 +3307,8 @@ class _KeyboardInputPageState extends State<_KeyboardInputPage> {
               runSpacing: 8,
               children: [
                 ElevatedButton(
-                  onPressed: () => Navigator.of(context).pop('send:${_controller.text}'),
+                  onPressed: () =>
+                      Navigator.of(context).pop('send:${_controller.text}'),
                   child: const Text('Send'),
                 ),
                 ElevatedButton(
@@ -2677,7 +3371,3 @@ class _KeyboardInputPageState extends State<_KeyboardInputPage> {
     );
   }
 }
-
-
-
-
