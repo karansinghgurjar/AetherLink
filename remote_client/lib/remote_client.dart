@@ -175,7 +175,6 @@ class RemoteClient {
   bool _readLoopRunning = false;
   bool _decodeLoopRunning = false;
   _PendingCompressedFrame? _pendingCompressedFrame;
-  int _decodedFrameCount = 0;
   int _replacedCompressedFrameCount = 0;
 
   RemoteClient({
@@ -432,7 +431,6 @@ class RemoteClient {
           receivedTimestampMs: decoded['received_timestamp_ms'] as int,
           messageType: pendingFrame.messageType,
         );
-        _decodedFrameCount += 1;
         if (frame.frameId % _frameLogSampleEvery == 0) {
           print(
             'video frame decoded frame_id=${frame.frameId} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} age_ms=${frame.ageMs} width=${frame.width} height=${frame.height}',
