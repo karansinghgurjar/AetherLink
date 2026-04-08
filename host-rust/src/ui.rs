@@ -569,6 +569,29 @@ impl eframe::App for HostApp {
                     egui::TextEdit::singleline(&mut self.download_dir),
                 );
             });
+            let effective_download_dir = {
+                let trimmed = self.download_dir.trim();
+                if trimmed.is_empty() {
+                    self.config.resolved_download_dir()
+                } else {
+                    let candidate = std::path::PathBuf::from(trimmed);
+                    if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|path| path.parent().map(|parent| parent.join(&candidate)))
+                            .unwrap_or(candidate)
+                    }
+                }
+            };
+            ui.label(format!(
+                "Effective Receive Folder: {}",
+                effective_download_dir.display()
+            ));
+            if self.download_dir.trim().is_empty() {
+                ui.small("Using default host-local folder because Download Dir is blank.");
+            }
 
             ui.separator();
             ui.label("Default Session Config");
@@ -623,6 +646,20 @@ impl eframe::App for HostApp {
             ui.separator();
             ui.label(format!("Status: {}", self.status));
             ui.label(format!("Monitors: {}", self.monitor_summary));
+            ui.label(format!(
+                "Receive Folder: {}",
+                self.config.resolved_download_dir().display()
+            ));
+            let trust_store_path = trust_store::path();
+            let pending_request_count = trust_store::pending_request_count();
+            let trusted_devices = trust_store::list_trusted_devices();
+            let trusted_device_count = trusted_devices.len();
+            let revoked_device_count = trusted_devices.iter().filter(|device| device.revoked).count();
+            ui.label(format!("Trust Store: {}", trust_store_path.display()));
+            ui.label(format!(
+                "Trust Summary: {} pending, {} trusted, {} revoked",
+                pending_request_count, trusted_device_count, revoked_device_count
+            ));
             ui.label(if self.token.trim().is_empty() {
                 "Auth: Disabled"
             } else {
@@ -653,7 +690,7 @@ impl eframe::App for HostApp {
             ));
 
             ui.separator();
-            ui.label("Pending Pair Requests");
+            ui.label(format!("Pending Pair Requests ({pending_request_count})"));
             let pending_requests = trust_store::list_pending_requests();
             if pending_requests.is_empty() {
                 ui.label("No pending pair requests.");
@@ -682,8 +719,9 @@ impl eframe::App for HostApp {
             }
 
             ui.separator();
-            ui.label("Trusted Devices");
-            let trusted_devices = trust_store::list_trusted_devices();
+            ui.label(format!(
+                "Trusted Devices ({trusted_device_count} total, {revoked_device_count} revoked)"
+            ));
             if trusted_devices.is_empty() {
                 ui.label("No trusted devices.");
             } else {
