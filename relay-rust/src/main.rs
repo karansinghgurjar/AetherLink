@@ -120,6 +120,9 @@ async fn handle_connection(
     match control {
         RelayControlMessage::RelayRegisterHost { host_id, token } => {
             if access_token != token {
+                eprintln!(
+                    "Relay host registration rejected: host_id={host_id} peer={peer_addr} reason=access_token_rejected"
+                );
                 send_control(
                     &mut stream,
                     json!({"type":"relay_error","message":"relay access token rejected"}),
@@ -132,6 +135,9 @@ async fn handle_connection(
             {
                 let mut guard = registry.lock().await;
                 if guard.contains_key(&host_id) {
+                    eprintln!(
+                        "Relay host registration rejected: host_id={host_id} peer={peer_addr} reason=duplicate_registration"
+                    );
                     send_control(
                         &mut stream,
                         json!({"type":"relay_error","message":"duplicate host registration","host_id":host_id}),
@@ -148,7 +154,7 @@ async fn handle_connection(
                 );
             }
 
-            eprintln!("Relay host registered: host_id={host_id} peer={peer_addr}");
+            eprintln!("Relay host registered: host_id={host_id} peer={peer_addr} waiting_for_client=true");
             send_control(
                 &mut stream,
                 json!({"type":"relay_host_registered","host_id":host_id}),
@@ -167,6 +173,11 @@ async fn handle_connection(
 
             let session_id = format!("{}-{}", host_id, Instant::now().elapsed().as_nanos());
             let mut client_stream = matched.stream;
+            eprintln!(
+                "Relay session creating: host_id={host_id} session_id={session_id} host_peer={peer_addr} client_peer={} device_id={}",
+                matched.peer_addr,
+                matched.device_id.as_deref().unwrap_or("unknown")
+            );
 
             send_control(
                 &mut stream,
@@ -208,8 +219,9 @@ async fn handle_connection(
                 client_read,
                 host_write,
             ));
-            let _ = tokio::join!(host_to_client, client_to_host);
-            eprintln!("Relay session closed: host_id={host_id} session_id={session_id}");
+            let (host_to_client_result, client_to_host_result) = tokio::join!(host_to_client, client_to_host);
+            let close_reason = describe_session_close(&host_to_client_result, &client_to_host_result);
+            eprintln!("Relay session closed: host_id={host_id} session_id={session_id} reason={close_reason}");
             Ok(())
         }
         RelayControlMessage::RelayConnectClient {
@@ -227,7 +239,7 @@ async fn handle_connection(
             };
 
             let Some(registration) = registration else {
-                eprintln!("Relay connect rejected: host_id={host_id} reason=host_offline");
+                eprintln!("Relay connect rejected: host_id={host_id} peer={peer_addr} reason=host_offline");
                 send_control(
                     &mut stream,
                     json!({"type":"relay_error","message":"host offline","host_id":host_id}),
@@ -237,6 +249,9 @@ async fn handle_connection(
             };
 
             if registration.relay_token != token {
+                eprintln!(
+                    "Relay client connect rejected: host_id={host_id} peer={peer_addr} reason=access_token_rejected"
+                );
                 send_control(
                     &mut stream,
                     json!({"type":"relay_error","message":"relay access token rejected","host_id":host_id}),
@@ -286,6 +301,22 @@ where
         write_message(&mut writer, msg_type, &payload).await?;
     }
     Ok(())
+}
+
+fn describe_session_close(
+    host_to_client_result: &std::result::Result<Result<()>, tokio::task::JoinError>,
+    client_to_host_result: &std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> String {
+    let describe = |label: &str, result: &std::result::Result<Result<()>, tokio::task::JoinError>| match result {
+        Ok(Ok(())) => format!("{label}=eof"),
+        Ok(Err(err)) => format!("{label}=io_error:{err}"),
+        Err(err) => format!("{label}=join_error:{err}"),
+    };
+    format!(
+        "{}, {}",
+        describe("host_to_client", host_to_client_result),
+        describe("client_to_host", client_to_host_result)
+    )
 }
 
 fn load_tls_acceptor(config: &RelayConfig) -> Result<TlsAcceptor> {
