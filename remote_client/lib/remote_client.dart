@@ -22,7 +22,7 @@ const int _codecJpeg = 0x01;
 const int _audioCodecPcmS16Le = 0x00;
 const int _frameLogSampleEvery = 30;
 const int _maxPendingAudioPackets = 6;
-const int _audioMaxQueueAgeMs = 150;
+const int _audioMaxQueueAgeMs = 100;
 const int _latencySummaryIntervalMs = 5000;
 const bool kDebugAudioOnlyMode = bool.fromEnvironment(
   'AETHERLINK_AUDIO_ONLY_MODE',
@@ -135,12 +135,19 @@ class _SlidingIntStats {
 
   bool get isEmpty => _samples.isEmpty;
 
+  double get average {
+    if (_samples.isEmpty) {
+      return 0;
+    }
+    final total = _samples.fold<int>(0, (sum, value) => sum + value);
+    return total / _samples.length;
+  }
+
   String get averageLabel {
     if (_samples.isEmpty) {
       return '-';
     }
-    final total = _samples.fold<int>(0, (sum, value) => sum + value);
-    return (total / _samples.length).toStringAsFixed(1);
+    return average.toStringAsFixed(1);
   }
 
   int get p95 {
@@ -151,6 +158,18 @@ class _SlidingIntStats {
     final index = ((sorted.length - 1) * 0.95).floor();
     return sorted[index];
   }
+}
+
+class _InputLatencyProbe {
+  const _InputLatencyProbe({
+    required this.kind,
+    required this.sentAt,
+    required this.frameIdBeforeSend,
+  });
+
+  final String kind;
+  final DateTime sentAt;
+  final int frameIdBeforeSend;
 }
 
 class TrustedDeviceIdentity {
@@ -310,7 +329,11 @@ class RemoteClient {
   int _audioPacketsSubmitted = 0;
   int _audioPacketsDropped = 0;
   int _audioLateDrops = 0;
+  int _decodePressureDrops = 0;
   int _targetFrameBudgetMs = 100;
+  int _lastDecodedFrameId = 0;
+  _InputLatencyProbe? _pendingInputLatencyProbe;
+  final _SlidingIntStats _inputToVisibleMs = _SlidingIntStats();
   int _lastVideoSummaryAtMs = 0;
   int _lastAudioSummaryAtMs = 0;
   int _lastTransportSummaryAtMs = 0;
@@ -636,6 +659,7 @@ class RemoteClient {
           decodeEndTimestampMs: decodeEndTimestampMs,
           isPlaceholder: decoded['is_placeholder'] == true,
         );
+        _lastDecodedFrameId = frame.frameId;
         final expectedBytes = frame.width * frame.height * 4;
         if (frame.width <= 0 ||
             frame.height <= 0 ||
@@ -649,6 +673,17 @@ class RemoteClient {
         final receiveToEmitMs =
             DateTime.now().millisecondsSinceEpoch - frame.receivedTimestampMs;
         _videoReceiveToEmitMs.add(receiveToEmitMs);
+        if (_shouldDropDeltaUnderDecodePressure(frame.messageType)) {
+          _decodePressureDrops += 1;
+          if (frame.frameId % _frameLogSampleEvery == 0) {
+            print(
+              '[video] decode-pressure drop frame_id=${frame.frameId} decode_avg=${_videoDecodeMs.averageLabel}ms decode_p95=${_videoDecodeMs.p95}ms budget_ms=$_targetFrameBudgetMs drops=$_decodePressureDrops',
+            );
+          }
+          unawaited(requestResync());
+          _maybeEmitVideoSummary();
+          continue;
+        }
         if (_pendingCompressedFrame != null &&
             receiveToEmitMs > max(_targetFrameBudgetMs, 80) &&
             !frame.isKeyframe) {
@@ -1274,6 +1309,9 @@ class RemoteClient {
       'frames_replaced_before_decode': _replacedCompressedFrameCount,
       'stale_drops_after_decode': _staleDropsAfterDecode,
       'decode_bypass_frames': _videoFramesDecodeBypassed,
+      'decode_pressure_drops': _decodePressureDrops,
+      'input_to_visible_avg_ms': _inputToVisibleMs.averageLabel,
+      'input_to_visible_p95_ms': _inputToVisibleMs.p95,
     });
   }
 
@@ -1295,6 +1333,44 @@ class RemoteClient {
       'audio_buffer_occupancy_p95_ms': _audioBufferOccupancyMs.p95,
       'audio_queue_target_ms': _audioMaxQueueAgeMs,
     });
+  }
+
+  bool _shouldDropDeltaUnderDecodePressure(int messageType) {
+    if (messageType != _msgVideoDelta) {
+      return false;
+    }
+    if (_videoDecodeMs.isEmpty) {
+      return false;
+    }
+    final decodeAvgMs = _videoDecodeMs.average;
+    final decodeP95Ms = _videoDecodeMs.p95;
+    return decodeAvgMs > (_targetFrameBudgetMs * 1.1) ||
+        decodeP95Ms > (_targetFrameBudgetMs * 1.35);
+  }
+
+  void markInputEventSent(String kind) {
+    _pendingInputLatencyProbe = _InputLatencyProbe(
+      kind: kind,
+      sentAt: DateTime.now(),
+      frameIdBeforeSend: _lastDecodedFrameId,
+    );
+  }
+
+  Map<String, Object?>? takeCompletedInputLatency(RemoteVideoFrame frame) {
+    final probe = _pendingInputLatencyProbe;
+    if (probe == null || frame.frameId <= probe.frameIdBeforeSend) {
+      return null;
+    }
+    _pendingInputLatencyProbe = null;
+    final latencyMs = DateTime.now().difference(probe.sentAt).inMilliseconds;
+    _inputToVisibleMs.add(latencyMs);
+    return <String, Object?>{
+      'kind': probe.kind,
+      'latency_ms': latencyMs,
+      'frame_id': frame.frameId,
+      'avg_ms': _inputToVisibleMs.averageLabel,
+      'p95_ms': _inputToVisibleMs.p95,
+    };
   }
 
   Future<void> _handleControlMessage(Map<String, dynamic> message) async {
