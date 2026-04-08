@@ -31,7 +31,7 @@ class RemoteApp extends StatelessWidget {
   }
 }
 
-enum ResolutionPreset { ultra, low, medium, high }
+enum ResolutionPreset { minimum, ultra, low, medium, high }
 
 enum ClipboardSyncMode { manual, hostToClient, clientToHost, bidirectional }
 
@@ -75,17 +75,19 @@ class _ViewportLayout {
 }
 
 class _SettingsState {
-  ResolutionPreset resolution = ResolutionPreset.low;
-  int fps = 12;
-  double jpegQuality = 50;
+  ResolutionPreset resolution = ResolutionPreset.ultra;
+  int fps = 8;
+  double jpegQuality = 40;
   bool viewOnly = false;
   int monitorIndex = 0;
   ClipboardSyncMode clipboardMode = ClipboardSyncMode.manual;
-  bool deltaStreamEnabled = true;
+  bool deltaStreamEnabled = false;
   bool audioEnabled = false;
 
   int get targetWidth {
     switch (resolution) {
+      case ResolutionPreset.minimum:
+        return 560;
       case ResolutionPreset.ultra:
         return 640;
       case ResolutionPreset.low:
@@ -96,6 +98,22 @@ class _SettingsState {
         return 1280;
     }
   }
+}
+
+class _PresetProfile {
+  const _PresetProfile({
+    required this.width,
+    required this.fps,
+    required this.jpegQuality,
+    required this.deltaEnabled,
+    required this.label,
+  });
+
+  final int width;
+  final int fps;
+  final double jpegQuality;
+  final bool deltaEnabled;
+  final String label;
 }
 
 class _RollingIntStats {
@@ -401,7 +419,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   static const int _maxTransferBytes = 100 * 1024 * 1024;
   static const List<int> _reconnectBackoffSeconds = <int>[1, 2, 5, 10];
   static const double _tapSlopSquared = 400;
-  static const Duration _directHealthTimeout = Duration(seconds: 20);
+  static const Duration _directHealthSoftTimeout = Duration(seconds: 20);
+  static const Duration _directHealthHardTimeout = Duration(seconds: 45);
   static const Duration _relayHealthTimeout = Duration(seconds: 120);
   static const Duration _startupHealthTimeout = Duration(seconds: 15);
   static const Duration _healthPollInterval = Duration(seconds: 2);
@@ -462,6 +481,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   Offset? _pointerDownPosition;
   bool _pointerMovedSinceDown = false;
   int _activePointerCount = 0;
+  final Map<int, Offset> _activePointerPositions = <int, Offset>{};
+  Map<int, Offset>? _twoFingerTapStartPositions;
+  Offset? _twoFingerTapNormalizedPosition;
+  bool _twoFingerTapCandidate = false;
+  int _twoFingerTapReleaseCount = 0;
+  Timer? _pendingSingleClickTimer;
+  Offset? _pendingSingleClickNormalizedPosition;
   double _viewportScale = 1.0;
   Offset _viewportPan = Offset.zero;
   double _scaleStartViewportScale = 1.0;
@@ -505,9 +531,50 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   int _presentedFrameCount = 0;
   int _videoWidgetBuildCount = 0;
   int _lastVideoUiSummaryAtMs = 0;
+  int _lastInputLatencyLogAtMs = 0;
 
   static const double _minViewportScale = 1.0;
   static const double _maxViewportScale = 4.0;
+  static const Map<ResolutionPreset, _PresetProfile> _presetProfiles =
+      <ResolutionPreset, _PresetProfile>{
+        ResolutionPreset.minimum: _PresetProfile(
+          width: 560,
+          fps: 6,
+          jpegQuality: 35,
+          deltaEnabled: false,
+          label: 'Minimum',
+        ),
+        ResolutionPreset.ultra: _PresetProfile(
+          width: 640,
+          fps: 8,
+          jpegQuality: 40,
+          deltaEnabled: false,
+          label: 'Ultra Responsive',
+        ),
+        ResolutionPreset.low: _PresetProfile(
+          width: 720,
+          fps: 10,
+          jpegQuality: 45,
+          deltaEnabled: true,
+          label: 'Responsive+',
+        ),
+        ResolutionPreset.medium: _PresetProfile(
+          width: 960,
+          fps: 12,
+          jpegQuality: 50,
+          deltaEnabled: true,
+          label: 'Balanced',
+        ),
+        ResolutionPreset.high: _PresetProfile(
+          width: 1280,
+          fps: 15,
+          jpegQuality: 60,
+          deltaEnabled: true,
+          label: 'Quality',
+        ),
+      };
+  static const Duration _doubleTapWindow = Duration(milliseconds: 260);
+  static const double _doubleTapNormalizedDistance = 0.04;
 
   @override
   void initState() {
@@ -522,9 +589,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     unawaited(_bootstrapTrustIdentity());
   }
 
+  void _applyPresetProfile(ResolutionPreset preset) {
+    final profile = _presetProfiles[preset]!;
+    _settings.resolution = preset;
+    _settings.fps = profile.fps;
+    _settings.jpegQuality = profile.jpegQuality;
+    _settings.deltaStreamEnabled = profile.deltaEnabled;
+  }
+
   @override
   void dispose() {
     _healthTimer?.cancel();
+    _pendingSingleClickTimer?.cancel();
     _frameSubscription?.cancel();
     _controlSubscription?.cancel();
     _framePresenter.dispose();
@@ -551,6 +627,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _lastRenderedFrameAgeMs = renderedAgeMs;
     _awaitingResyncKeyframe = false;
     _presentedFrameCount += 1;
+    _logInputLatencyIfReady(frame);
     _maybeLogVideoUiSummary();
     if (firstPresentedFrame) {
       _streamPhase = StreamPhase.streaming;
@@ -585,6 +662,25 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     );
     _videoWidgetBuildCount = 0;
     _presentedFrameCount = 0;
+  }
+
+  void _markInputSent(String kind) {
+    _remoteClient?.markInputEventSent(kind);
+  }
+
+  void _logInputLatencyIfReady(RemoteVideoFrame frame) {
+    final sample = _remoteClient?.takeCompletedInputLatency(frame);
+    if (sample == null) {
+      return;
+    }
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastInputLatencyLogAtMs < 1000) {
+      return;
+    }
+    _lastInputLatencyLogAtMs = nowMs;
+    _recordLog(
+      'Input-to-visible: kind=${sample['kind']} latency=${sample['latency_ms']}ms frame=${sample['frame_id']} avg=${sample['avg_ms']}ms p95=${sample['p95_ms']}ms',
+    );
   }
 
   _ViewportLayout? _computeViewportLayout(
@@ -661,6 +757,118 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     setState(() {
       _cursorNormalizedPosition = position;
     });
+  }
+
+  bool _isCloseNormalized(Offset a, Offset b) {
+    return (a - b).distance <= _doubleTapNormalizedDistance;
+  }
+
+  Future<void> _sendLeftClickAt(Offset normalized) async {
+    final client = _remoteClient;
+    if (client == null) {
+      return;
+    }
+    _updateCursorNormalized(normalized);
+    _markInputSent('left_click');
+    await client.sendMouseMove(normalized.dx, normalized.dy);
+    await client.sendLeftClick();
+  }
+
+  Future<void> _sendRightClickAt(Offset normalized) async {
+    final client = _remoteClient;
+    if (client == null) {
+      return;
+    }
+    _updateCursorNormalized(normalized);
+    _markInputSent('right_click');
+    await client.sendMouseMove(normalized.dx, normalized.dy);
+    await client.sendRightClick();
+  }
+
+  void _scheduleSingleClick(Offset normalized) {
+    final previousTimer = _pendingSingleClickTimer;
+    final previousPosition = _pendingSingleClickNormalizedPosition;
+    if (previousTimer != null &&
+        previousTimer.isActive &&
+        previousPosition != null) {
+      if (_isCloseNormalized(previousPosition, normalized)) {
+        previousTimer.cancel();
+        _pendingSingleClickTimer = null;
+        _pendingSingleClickNormalizedPosition = null;
+        _recordLog(
+          'double tap detected rel=(${normalized.dx.toStringAsFixed(3)}, ${normalized.dy.toStringAsFixed(3)})',
+        );
+        unawaited(() async {
+          try {
+            await _sendLeftClickAt(normalized);
+            await Future<void>.delayed(const Duration(milliseconds: 40));
+            await _sendLeftClickAt(normalized);
+          } catch (e) {
+            _recordLog('double click send failed: $e');
+          }
+        }());
+        return;
+      }
+      previousTimer.cancel();
+      _pendingSingleClickTimer = null;
+      _pendingSingleClickNormalizedPosition = null;
+      unawaited(() async {
+        try {
+          await _sendLeftClickAt(previousPosition);
+        } catch (e) {
+          _recordLog('single click flush failed: $e');
+        }
+      }());
+    }
+
+    _pendingSingleClickNormalizedPosition = normalized;
+    _pendingSingleClickTimer = Timer(_doubleTapWindow, () {
+      final clickPosition = _pendingSingleClickNormalizedPosition;
+      _pendingSingleClickTimer = null;
+      _pendingSingleClickNormalizedPosition = null;
+      if (clickPosition == null) {
+        return;
+      }
+      unawaited(() async {
+        try {
+          await _sendLeftClickAt(clickPosition);
+        } catch (e) {
+          _recordLog('single click send failed: $e');
+        }
+      }());
+    });
+  }
+
+  void _cancelPendingSingleClick() {
+    _pendingSingleClickTimer?.cancel();
+    _pendingSingleClickTimer = null;
+    _pendingSingleClickNormalizedPosition = null;
+  }
+
+  void _beginTwoFingerTapCandidate(BoxConstraints constraints, Size frameSize) {
+    if (_activePointerPositions.length != 2) {
+      return;
+    }
+    final positions = _activePointerPositions.values.toList(growable: false);
+    final centroid = Offset(
+      (positions[0].dx + positions[1].dx) / 2,
+      (positions[0].dy + positions[1].dy) / 2,
+    );
+    final normalized = _localToRemoteNormalized(
+      centroid,
+      constraints,
+      frameSize,
+    );
+    if (normalized == null) {
+      return;
+    }
+    _twoFingerTapCandidate = true;
+    _twoFingerTapReleaseCount = 0;
+    _twoFingerTapStartPositions = Map<int, Offset>.from(
+      _activePointerPositions,
+    );
+    _twoFingerTapNormalizedPosition = normalized;
+    _cancelPendingSingleClick();
   }
 
   void _zoomBy(double scaleDelta) {
@@ -1309,7 +1517,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   void _startHealthChecks() {
     _healthTimer?.cancel();
     _recordLog(
-      'Health timer started (${_useRelayMode ? 'relay' : 'direct'}) startup_threshold=${_startupHealthTimeout.inSeconds}s steady_threshold=${(_useRelayMode ? _relayHealthTimeout : _directHealthTimeout).inSeconds}s',
+      'Health timer started (${_useRelayMode ? 'relay' : 'direct'}) startup_threshold=${_startupHealthTimeout.inSeconds}s steady_threshold=${(_useRelayMode ? _relayHealthTimeout : _directHealthSoftTimeout).inSeconds}s reconnect_threshold=${(_useRelayMode ? _relayHealthTimeout : _directHealthHardTimeout).inSeconds}s',
     );
     _healthTimer = Timer.periodic(_healthPollInterval, (_) async {
       if (!_connected) {
@@ -1317,8 +1525,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       }
 
       final now = DateTime.now();
-      final threshold = _hasRenderedFrame
-          ? (_useRelayMode ? _relayHealthTimeout : _directHealthTimeout)
+      final softThreshold = _hasRenderedFrame
+          ? (_useRelayMode ? _relayHealthTimeout : _directHealthSoftTimeout)
+          : _startupHealthTimeout;
+      final hardThreshold = _hasRenderedFrame
+          ? (_useRelayMode ? _relayHealthTimeout : _directHealthHardTimeout)
           : _startupHealthTimeout;
       final baselineAt =
           <DateTime?>[
@@ -1339,7 +1550,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       }
 
       final idleFor = now.difference(baselineAt);
-      final stale = idleFor > threshold;
+      final stale = idleFor > softThreshold;
       if (!stale) {
         return;
       }
@@ -1362,14 +1573,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
       if (!_hasRenderedFrame) {
         _recordLog(
-          'Startup health warning: no first frame yet after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s)',
+          'Startup health warning: no first frame yet after ${idleFor.inSeconds}s (threshold=${softThreshold.inSeconds}s)',
         );
       }
 
       if (_awaitingResyncKeyframe) {
-        if (idleFor > threshold + _resyncRecoveryTimeout) {
+        if (idleFor > hardThreshold + _resyncRecoveryTimeout) {
           _recordLog(
-            'Health recovery failed: no keyframe after resync for ${idleFor.inSeconds}s, reconnecting',
+            'Health recovery failed: no keyframe after resync for ${idleFor.inSeconds}s, reconnecting (hard_threshold=${hardThreshold.inSeconds}s)',
           );
           await _disconnect();
           _queueReconnectIfAllowed('resync recovery timeout');
@@ -1388,7 +1599,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
       if (shouldRequestResync) {
         _recordLog(
-          'Health timeout fired after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s), requesting resync (phase=${_streamPhase.name})',
+          'Health timeout fired after ${idleFor.inSeconds}s (threshold=${softThreshold.inSeconds}s), requesting resync (phase=${_streamPhase.name})',
         );
         try {
           await _requestResyncWithGuard(
@@ -1407,7 +1618,21 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           await _disconnect();
           _queueReconnectIfAllowed('health check timeout');
         }
+        return;
       }
+
+      if (idleFor <= hardThreshold) {
+        _recordLog(
+          'Health timeout suppressed during cooldown: idle=${idleFor.inSeconds}s soft=${softThreshold.inSeconds}s hard=${hardThreshold.inSeconds}s phase=${_streamPhase.name}',
+        );
+        return;
+      }
+
+      _recordLog(
+        'Health reconnect fired after ${idleFor.inSeconds}s (hard_threshold=${hardThreshold.inSeconds}s), reconnecting (phase=${_streamPhase.name})',
+      );
+      await _disconnect();
+      _queueReconnectIfAllowed('health hard timeout');
     });
   }
 
@@ -1704,6 +1929,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     );
     unawaited(() async {
       try {
+        _markInputSent('pointer_down_move');
         await client.sendMouseMove(relX, relY);
       } catch (e) {
         debugPrint('pointer down send failed: $e');
@@ -1727,6 +1953,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         (localPosition - down).distanceSquared > _tapSlopSquared) {
       _pointerMovedSinceDown = true;
     }
+    if (_twoFingerTapCandidate && _twoFingerTapStartPositions != null) {
+      for (final entry in _activePointerPositions.entries) {
+        final start = _twoFingerTapStartPositions![entry.key];
+        if (start != null &&
+            (entry.value - start).distanceSquared > _tapSlopSquared) {
+          _twoFingerTapCandidate = false;
+          break;
+        }
+      }
+    }
 
     final normalized = _localToRemoteNormalized(
       localPosition,
@@ -1741,6 +1977,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _updateCursorNormalized(normalized);
     unawaited(() async {
       try {
+        _markInputSent('pointer_move');
         await client.sendMouseMove(relX, relY);
       } catch (e) {
         debugPrint('pointer move send failed: $e');
@@ -1775,14 +2012,36 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     );
     _pointerDownPosition = null;
     _pointerMovedSinceDown = false;
+    if (_twoFingerTapCandidate && _twoFingerTapNormalizedPosition != null) {
+      _twoFingerTapReleaseCount += 1;
+      if (_twoFingerTapReleaseCount >= 2) {
+        final rightClickPosition = _twoFingerTapNormalizedPosition!;
+        _twoFingerTapCandidate = false;
+        _twoFingerTapStartPositions = null;
+        _twoFingerTapNormalizedPosition = null;
+        _twoFingerTapReleaseCount = 0;
+        _recordLog(
+          'two-finger tap detected rel=(${rightClickPosition.dx.toStringAsFixed(3)}, ${rightClickPosition.dy.toStringAsFixed(3)})',
+        );
+        unawaited(() async {
+          try {
+            await _sendRightClickAt(rightClickPosition);
+          } catch (e) {
+            _recordLog('two-finger right click failed: $e');
+          }
+        }());
+      }
+      return;
+    }
     unawaited(() async {
       try {
         if (shouldClick) {
           _recordLog(
-            'sending left_click rel=(${relX.toStringAsFixed(3)}, ${relY.toStringAsFixed(3)})',
+            'queue left_click rel=(${relX.toStringAsFixed(3)}, ${relY.toStringAsFixed(3)})',
           );
-          await client.sendLeftClick();
+          _scheduleSingleClick(normalized);
         } else {
+          _markInputSent('pointer_up_move');
           await client.sendMouseMove(relX, relY);
         }
       } catch (e) {
@@ -2154,7 +2413,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
     if (type == 'client_video_latency_summary') {
       _recordLog(
-        'Video decode summary: receive_to_decode_start_avg=${message['receive_to_decode_start_avg_ms']}ms p95=${message['receive_to_decode_start_p95_ms']}ms decode_avg=${message['decode_avg_ms']}ms p95=${message['decode_p95_ms']}ms receive_to_emit_avg=${message['receive_to_emit_avg_ms']}ms p95=${message['receive_to_emit_p95_ms']}ms replaced_before_decode=${message['frames_replaced_before_decode']} stale_drops_after_decode=${message['stale_drops_after_decode']} decode_bypass_frames=${message['decode_bypass_frames']}',
+        'Video decode summary: receive_to_decode_start_avg=${message['receive_to_decode_start_avg_ms']}ms p95=${message['receive_to_decode_start_p95_ms']}ms decode_avg=${message['decode_avg_ms']}ms p95=${message['decode_p95_ms']}ms receive_to_emit_avg=${message['receive_to_emit_avg_ms']}ms p95=${message['receive_to_emit_p95_ms']}ms replaced_before_decode=${message['frames_replaced_before_decode']} stale_drops_after_decode=${message['stale_drops_after_decode']} decode_pressure_drops=${message['decode_pressure_drops']} decode_bypass_frames=${message['decode_bypass_frames']}',
       );
       return;
     }
@@ -2646,16 +2905,32 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           behavior: HitTestBehavior.opaque,
           onPointerDown: (event) {
             _activePointerCount += 1;
+            _activePointerPositions[event.pointer] = event.localPosition;
+            if (_activePointerCount == 2) {
+              final frameSize = _framePresenter.frameSizeListenable.value;
+              if (frameSize != null) {
+                _beginTwoFingerTapCandidate(imageConstraints, frameSize);
+              }
+            } else if (_activePointerCount > 2) {
+              _twoFingerTapCandidate = false;
+            }
             if (_activePointerCount == 1) {
               _handlePointerDown(event.localPosition, imageConstraints);
             }
           },
-          onPointerMove: (event) =>
-              _handlePointerMove(event.localPosition, imageConstraints),
+          onPointerMove: (event) {
+            _activePointerPositions[event.pointer] = event.localPosition;
+            _handlePointerMove(event.localPosition, imageConstraints);
+          },
           onPointerUp: (event) {
+            _activePointerPositions.remove(event.pointer);
             _activePointerCount = math.max(0, _activePointerCount - 1);
+            _handlePointerUp(event.localPosition, imageConstraints);
             if (_activePointerCount == 0) {
-              _handlePointerUp(event.localPosition, imageConstraints);
+              _twoFingerTapCandidate = false;
+              _twoFingerTapStartPositions = null;
+              _twoFingerTapNormalizedPosition = null;
+              _twoFingerTapReleaseCount = 0;
             }
           },
           onPointerCancel: (_) {
@@ -2664,6 +2939,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               _pointerDownPosition = null;
               _pointerMovedSinceDown = false;
             }
+            _twoFingerTapCandidate = false;
+            _twoFingerTapStartPositions = null;
+            _twoFingerTapNormalizedPosition = null;
+            _twoFingerTapReleaseCount = 0;
           },
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
@@ -3154,7 +3433,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               ],
               onChanged: (value) {
                 if (value != null) {
-                  setState(() => _settings.resolution = value);
+                  setState(() => _applyPresetProfile(value));
                   unawaited(_persistClientPrefs());
                 }
               },
