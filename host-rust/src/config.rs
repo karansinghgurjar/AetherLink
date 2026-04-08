@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 fn host_app_dir() -> PathBuf {
@@ -100,9 +100,9 @@ impl Default for HostConfig {
             relay_host_id: "default-host".to_string(),
             relay_token: None,
             default_monitor_index: 0,
-            default_fps: 20,
-            default_jpeg_quality: 70,
-            default_target_width: Some(1280),
+            default_fps: 15,
+            default_jpeg_quality: 60,
+            default_target_width: Some(960),
             download_dir: None,
             panic_hotkey_enabled: true,
         }
@@ -143,6 +143,26 @@ impl HostConfig {
 
     pub fn normalized_auth_token(&self) -> Option<String> {
         self.auth_token.as_ref().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    pub fn resolved_download_dir(&self) -> PathBuf {
+        let configured = self
+            .download_dir
+            .as_ref()
+            .map(|dir| dir.trim())
+            .filter(|dir| !dir.is_empty());
+
+        match configured {
+            Some(dir) => {
+                let candidate = PathBuf::from(dir);
+                if candidate.is_absolute() {
+                    candidate
+                } else {
+                    host_app_dir().join(candidate)
+                }
+            }
+            None => host_app_dir().join(Path::new("received_files")),
+        }
     }
 
     pub fn apply_runtime_env(&self) {
