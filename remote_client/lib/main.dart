@@ -303,6 +303,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   static const Duration _startupHealthTimeout = Duration(seconds: 15);
   static const Duration _healthPollInterval = Duration(seconds: 2);
   static const Duration _resyncCooldown = Duration(seconds: 15);
+  static const Duration _resyncRecoveryTimeout = Duration(seconds: 15);
   static const String _savedHostsPrefsKey = 'saved_hosts_v1';
   static const String _lastHostPrefsKey = 'last_host';
   static const String _lastPortPrefsKey = 'last_port';
@@ -1063,6 +1064,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       }
 
       if (_awaitingResyncKeyframe) {
+        if (idleFor > threshold + _resyncRecoveryTimeout) {
+          _recordLog(
+            'Health recovery failed: no keyframe after resync for ${idleFor.inSeconds}s, reconnecting',
+          );
+          await _disconnect();
+          _queueReconnectIfAllowed('resync recovery timeout');
+          return;
+        }
         _recordLog(
           'Health timeout suppressed: already awaiting resync keyframe for ${idleFor.inSeconds}s',
         );
