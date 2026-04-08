@@ -22,12 +22,31 @@ const int _codecJpeg = 0x01;
 const int _audioCodecPcmS16Le = 0x00;
 const int _frameLogSampleEvery = 30;
 const int _maxPendingAudioPackets = 6;
-const bool kDebugAudioOnlyMode = bool.fromEnvironment('AETHERLINK_AUDIO_ONLY_MODE', defaultValue: false);
-const bool kDisableStartupStaleDrop =
-    bool.fromEnvironment('AETHERLINK_DISABLE_STARTUP_STALE_DROP', defaultValue: false);
+const int _audioMaxQueueAgeMs = 150;
+const int _latencySummaryIntervalMs = 5000;
+const bool kDebugAudioOnlyMode = bool.fromEnvironment(
+  'AETHERLINK_AUDIO_ONLY_MODE',
+  defaultValue: false,
+);
+const bool kDebugVideoDisabled = bool.fromEnvironment(
+  'AETHERLINK_VIDEO_DISABLED',
+  defaultValue: false,
+);
+const bool kDebugAudioDisabled = bool.fromEnvironment(
+  'AETHERLINK_AUDIO_DISABLED',
+  defaultValue: false,
+);
+const bool kDebugVideoDecodeBypass = bool.fromEnvironment(
+  'AETHERLINK_VIDEO_DECODE_BYPASS',
+  defaultValue: false,
+);
+const bool kDisableStartupStaleDrop = bool.fromEnvironment(
+  'AETHERLINK_DISABLE_STARTUP_STALE_DROP',
+  defaultValue: false,
+);
 
 class RemoteVideoFrame {
-  const RemoteVideoFrame({
+  RemoteVideoFrame({
     required this.frameId,
     required this.width,
     required this.height,
@@ -35,6 +54,10 @@ class RemoteVideoFrame {
     required this.captureTimestampMs,
     required this.receivedTimestampMs,
     required this.messageType,
+    required this.assemblyCompletedTimestampMs,
+    required this.decodeStartTimestampMs,
+    required this.decodeEndTimestampMs,
+    this.isPlaceholder = false,
   });
 
   final int frameId;
@@ -44,9 +67,18 @@ class RemoteVideoFrame {
   final int captureTimestampMs;
   final int receivedTimestampMs;
   final int messageType;
+  final int assemblyCompletedTimestampMs;
+  final int decodeStartTimestampMs;
+  final int decodeEndTimestampMs;
+  final bool isPlaceholder;
 
-  int get queueAgeMs => DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
-  int get hostClockAgeMs => DateTime.now().millisecondsSinceEpoch - captureTimestampMs;
+  int get queueAgeMs =>
+      DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
+  int get hostClockAgeMs =>
+      DateTime.now().millisecondsSinceEpoch - captureTimestampMs;
+  int get receiveToDecodeStartMs =>
+      decodeStartTimestampMs - receivedTimestampMs;
+  int get decodeMs => decodeEndTimestampMs - decodeStartTimestampMs;
 
   bool get isKeyframe => messageType == _msgVideoKeyframe;
 }
@@ -57,28 +89,68 @@ class _PendingCompressedFrame {
     required this.payload,
     required this.frameId,
     required this.receivedTimestampMs,
+    required this.assemblyCompletedTimestampMs,
   });
 
   final int messageType;
   final Uint8List payload;
   final int frameId;
   final int receivedTimestampMs;
+  final int assemblyCompletedTimestampMs;
 }
 
 class _PendingAudioPacket {
   const _PendingAudioPacket({
     required this.payload,
     required this.receivedTimestampMs,
+    required this.enqueueTimestampMs,
     required this.ptsMs,
     required this.sequence,
+    required this.queueDepthAtEnqueue,
   });
 
   final Uint8List payload;
   final int receivedTimestampMs;
+  final int enqueueTimestampMs;
   final int ptsMs;
   final int sequence;
+  final int queueDepthAtEnqueue;
 
-  int get queueAgeMs => DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
+  int get queueAgeMs =>
+      DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
+}
+
+class _SlidingIntStats {
+  _SlidingIntStats();
+
+  static const int _maxSamples = 240;
+  final ListQueue<int> _samples = ListQueue<int>();
+
+  void add(int value) {
+    _samples.addLast(value);
+    while (_samples.length > _maxSamples) {
+      _samples.removeFirst();
+    }
+  }
+
+  bool get isEmpty => _samples.isEmpty;
+
+  String get averageLabel {
+    if (_samples.isEmpty) {
+      return '-';
+    }
+    final total = _samples.fold<int>(0, (sum, value) => sum + value);
+    return (total / _samples.length).toStringAsFixed(1);
+  }
+
+  int get p95 {
+    if (_samples.isEmpty) {
+      return 0;
+    }
+    final sorted = _samples.toList()..sort();
+    final index = ((sorted.length - 1) * 0.95).floor();
+    return sorted[index];
+  }
 }
 
 class TrustedDeviceIdentity {
@@ -98,13 +170,19 @@ class TrustedDeviceIdentity {
 class AndroidTrustIdentityService {
   AndroidTrustIdentityService._();
 
-  static final AndroidTrustIdentityService instance = AndroidTrustIdentityService._();
+  static final AndroidTrustIdentityService instance =
+      AndroidTrustIdentityService._();
   static const MethodChannel _channel = MethodChannel('aetherlink/trust');
 
   Future<TrustedDeviceIdentity> getOrCreateDeviceIdentity() async {
-    final raw = await _channel.invokeMapMethod<String, dynamic>('getOrCreateDeviceIdentity');
+    final raw = await _channel.invokeMapMethod<String, dynamic>(
+      'getOrCreateDeviceIdentity',
+    );
     if (raw == null) {
-      throw PlatformException(code: 'trust_identity_failed', message: 'Missing identity payload');
+      throw PlatformException(
+        code: 'trust_identity_failed',
+        message: 'Missing identity payload',
+      );
     }
     return TrustedDeviceIdentity(
       deviceId: raw['deviceId'] as String? ?? '',
@@ -115,11 +193,15 @@ class AndroidTrustIdentityService {
   }
 
   Future<Uint8List> signChallenge(Uint8List payload) async {
-    final signature = await _channel.invokeMethod<Uint8List>('signChallenge', <String, Object>{
-      'payload': payload,
-    });
+    final signature = await _channel.invokeMethod<Uint8List>(
+      'signChallenge',
+      <String, Object>{'payload': payload},
+    );
     if (signature == null || signature.isEmpty) {
-      throw PlatformException(code: 'trust_sign_failed', message: 'Empty signature');
+      throw PlatformException(
+        code: 'trust_sign_failed',
+        message: 'Empty signature',
+      );
     }
     return signature;
   }
@@ -135,13 +217,19 @@ class _AndroidAudioSink {
   int? _sampleRate;
   int? _channels;
 
-  Future<void> playPcm16({required int sampleRate, required int channels, required Uint8List data}) async {
+  Future<void> playPcm16({
+    required int sampleRate,
+    required int channels,
+    required Uint8List data,
+  }) async {
     if (!_started || _sampleRate != sampleRate || _channels != channels) {
       await _channel.invokeMethod<void>('startPcm16', <String, Object>{
         'sampleRate': sampleRate,
         'channels': channels,
       });
-      print('[audio] playback started sampleRate=$sampleRate channels=$channels');
+      print(
+        '[audio] playback started sampleRate=$sampleRate channels=$channels',
+      );
       _started = true;
       _sampleRate = sampleRate;
       _channels = channels;
@@ -161,6 +249,13 @@ class _AndroidAudioSink {
     _sampleRate = null;
     _channels = null;
   }
+
+  Future<Map<String, dynamic>> getPlaybackStats() async {
+    final raw = await _channel.invokeMapMethod<String, dynamic>(
+      'getPlaybackStats',
+    );
+    return raw ?? const <String, dynamic>{};
+  }
 }
 
 class RemoteClient {
@@ -171,8 +266,10 @@ class RemoteClient {
   final String? relayToken;
   SecureSocket? _socket;
   StreamIterator<Uint8List>? _iterator;
-  final StreamController<Map<String, dynamic>> _controlMessages = StreamController<Map<String, dynamic>>.broadcast();
-  final StreamController<RemoteVideoFrame> _videoFrames = StreamController<RemoteVideoFrame>.broadcast();
+  final StreamController<Map<String, dynamic>> _controlMessages =
+      StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<RemoteVideoFrame> _videoFrames =
+      StreamController<RemoteVideoFrame>.broadcast();
   final ListQueue<String> _recentClipboardSyncIds = ListQueue<String>();
   String _clipboardMode = 'manual';
   String? _lastAppliedClipboardHash;
@@ -181,12 +278,14 @@ class RemoteClient {
   int _pendingOffset = 0;
   bool _authenticated = false;
   final _AndroidAudioSink _audioSink = _AndroidAudioSink();
-  final AndroidTrustIdentityService _trustIdentityService = AndroidTrustIdentityService.instance;
+  final AndroidTrustIdentityService _trustIdentityService =
+      AndroidTrustIdentityService.instance;
   TrustedDeviceIdentity? _trustedIdentity;
   Uint8List? _pendingPairClientNonce;
   bool _trustedAuthEnabled = false;
   String? _activeTransferId;
-  final Map<String, Completer<void>> _pendingTransferStarts = <String, Completer<void>>{};
+  final Map<String, Completer<void>> _pendingTransferStarts =
+      <String, Completer<void>>{};
   final Map<String, Map<int, Completer<void>>> _pendingTransferChunkAcks =
       <String, Map<int, Completer<void>>>{};
   Isolate? _frameDecodeIsolate;
@@ -197,13 +296,31 @@ class RemoteClient {
   int _nextDecodeRequestId = 1;
   bool _readLoopRunning = false;
   bool _decodeLoopRunning = false;
+  bool _controlDispatchRunning = false;
   _PendingCompressedFrame? _pendingCompressedFrame;
   int _replacedCompressedFrameCount = 0;
-  final Queue<_PendingAudioPacket> _pendingAudioPackets = Queue<_PendingAudioPacket>();
+  int _staleDropsAfterDecode = 0;
+  int _videoFramesDecodeBypassed = 0;
+  final Queue<Map<String, dynamic>> _pendingControlMessages =
+      Queue<Map<String, dynamic>>();
+  final Queue<_PendingAudioPacket> _pendingAudioPackets =
+      Queue<_PendingAudioPacket>();
   bool _audioDispatchRunning = false;
   int _audioPacketsReceived = 0;
   int _audioPacketsSubmitted = 0;
   int _audioPacketsDropped = 0;
+  int _audioLateDrops = 0;
+  int _targetFrameBudgetMs = 100;
+  int _lastVideoSummaryAtMs = 0;
+  int _lastAudioSummaryAtMs = 0;
+  int _lastTransportSummaryAtMs = 0;
+  final _SlidingIntStats _transportDispatchMs = _SlidingIntStats();
+  final _SlidingIntStats _videoReceiveToDecodeStartMs = _SlidingIntStats();
+  final _SlidingIntStats _videoDecodeMs = _SlidingIntStats();
+  final _SlidingIntStats _videoReceiveToEmitMs = _SlidingIntStats();
+  final _SlidingIntStats _audioReceiveToSubmitMs = _SlidingIntStats();
+  final _SlidingIntStats _audioQueueDepthStats = _SlidingIntStats();
+  final _SlidingIntStats _audioBufferOccupancyMs = _SlidingIntStats();
 
   RemoteClient({
     required this.host,
@@ -248,7 +365,8 @@ class RemoteClient {
       host,
       port,
       timeout: const Duration(seconds: 10),
-      onBadCertificate: (cert) => kAllowInsecureLocalTlsForTesting || _isPinnedCertificate(cert),
+      onBadCertificate: (cert) =>
+          kAllowInsecureLocalTlsForTesting || _isPinnedCertificate(cert),
     );
   }
 
@@ -269,21 +387,25 @@ class RemoteClient {
         continue;
       }
 
-      final decoded = jsonDecode(utf8.decode(message.$2)) as Map<String, dynamic>;
+      final decoded =
+          jsonDecode(utf8.decode(message.$2)) as Map<String, dynamic>;
       final type = decoded['type'] as String?;
       if (type == 'relay_session_ready') {
         _controlMessages.add(decoded);
         return;
       }
       if (type == 'relay_error') {
-        throw SocketException(decoded['message'] as String? ?? 'Relay connection failed');
+        throw SocketException(
+          decoded['message'] as String? ?? 'Relay connection failed',
+        );
       }
       _controlMessages.add(decoded);
     }
   }
 
   Future<TrustedDeviceIdentity> getOrCreateDeviceIdentity() async {
-    _trustedIdentity ??= await _trustIdentityService.getOrCreateDeviceIdentity();
+    _trustedIdentity ??= await _trustIdentityService
+        .getOrCreateDeviceIdentity();
     return _trustedIdentity!;
   }
 
@@ -305,7 +427,9 @@ class RemoteClient {
     await _sendControlJson(<String, Object?>{
       'type': 'pair_request',
       'device_id': identity.deviceId,
-      'device_name': (deviceName?.trim().isNotEmpty ?? false) ? deviceName!.trim() : identity.deviceName,
+      'device_name': (deviceName?.trim().isNotEmpty ?? false)
+          ? deviceName!.trim()
+          : identity.deviceName,
       'public_key_pem': identity.publicKeyPem,
       'client_nonce_b64': base64Encode(clientNonce),
     });
@@ -316,7 +440,10 @@ class RemoteClient {
       ..._pendingTransferStarts.keys,
       ..._pendingTransferChunkAcks.keys,
     }) {
-      _failPendingTransfer(transferId, const SocketException('connection closed'));
+      _failPendingTransfer(
+        transferId,
+        const SocketException('connection closed'),
+      );
     }
     await _iterator?.cancel();
     await _socket?.close();
@@ -335,6 +462,8 @@ class RemoteClient {
     _audioDispatchRunning = false;
     _readLoopRunning = false;
     _decodeLoopRunning = false;
+    _controlDispatchRunning = false;
+    _pendingControlMessages.clear();
     for (final pending in _pendingDecodeResponses.values) {
       if (!pending.isCompleted) {
         pending.completeError(const SocketException('frame decoder closed'));
@@ -375,20 +504,24 @@ class RemoteClient {
           if (message == null) {
             break;
           }
+          final dispatchStartMs = DateTime.now().millisecondsSinceEpoch;
           if (message.$1 == _msgControlInput) {
             try {
-              final decoded = jsonDecode(utf8.decode(message.$2)) as Map<String, dynamic>;
-              await _handleControlMessage(decoded);
+              final decoded =
+                  jsonDecode(utf8.decode(message.$2)) as Map<String, dynamic>;
+              _enqueueControlMessage(decoded);
             } catch (_) {
               // Ignore malformed control messages from the host.
             }
+            _recordTransportDispatch(dispatchStartMs);
             continue;
           }
           if (message.$1 == _msgAudioPacket) {
             _controlMessages.add(<String, dynamic>{
               'type': 'client_audio_packet',
             });
-            await _handleAudioPacket(message.$2);
+            _handleAudioPacket(message.$2);
+            _recordTransportDispatch(dispatchStartMs);
             continue;
           }
           if (message.$1 == _msgVideoFrame ||
@@ -400,6 +533,7 @@ class RemoteClient {
               'payload_len': message.$2.length,
             });
             _enqueueCompressedFrame(message.$1, message.$2);
+            _recordTransportDispatch(dispatchStartMs);
           }
         }
       } catch (err, stackTrace) {
@@ -413,7 +547,7 @@ class RemoteClient {
   }
 
   void _enqueueCompressedFrame(int messageType, Uint8List payload) {
-    if (kDebugAudioOnlyMode) {
+    if (kDebugAudioOnlyMode || kDebugVideoDisabled) {
       return;
     }
     final frameId = _peekFrameId(messageType, payload);
@@ -445,6 +579,7 @@ class RemoteClient {
       payload: payload,
       frameId: frameId,
       receivedTimestampMs: receivedTimestampMs,
+      assemblyCompletedTimestampMs: receivedTimestampMs,
     );
     if (!_decodeLoopRunning) {
       unawaited(_runDecodeLoop());
@@ -463,7 +598,15 @@ class RemoteClient {
           break;
         }
         _pendingCompressedFrame = null;
-        final decoded = await _decodeFrameOnWorker(pendingFrame);
+        final decodeStartTimestampMs = DateTime.now().millisecondsSinceEpoch;
+        _videoReceiveToDecodeStartMs.add(
+          decodeStartTimestampMs - pendingFrame.receivedTimestampMs,
+        );
+        final decoded = kDebugVideoDecodeBypass
+            ? _buildDecodeBypassFrame(pendingFrame)
+            : await _decodeFrameOnWorker(pendingFrame);
+        final decodeEndTimestampMs = DateTime.now().millisecondsSinceEpoch;
+        _videoDecodeMs.add(decodeEndTimestampMs - decodeStartTimestampMs);
         if (decoded['request_resync'] == true) {
           print(
             'video frame dropped frame_id=${pendingFrame.frameId} dropped_reason=${decoded['drop_reason'] ?? 'resync_required'}',
@@ -487,20 +630,43 @@ class RemoteClient {
           captureTimestampMs: decoded['capture_timestamp_ms'] as int,
           receivedTimestampMs: decoded['received_timestamp_ms'] as int,
           messageType: pendingFrame.messageType,
+          assemblyCompletedTimestampMs:
+              pendingFrame.assemblyCompletedTimestampMs,
+          decodeStartTimestampMs: decodeStartTimestampMs,
+          decodeEndTimestampMs: decodeEndTimestampMs,
+          isPlaceholder: decoded['is_placeholder'] == true,
         );
         final expectedBytes = frame.width * frame.height * 4;
-        if (frame.width <= 0 || frame.height <= 0 || frame.rgbaBytes.length != expectedBytes) {
+        if (frame.width <= 0 ||
+            frame.height <= 0 ||
+            frame.rgbaBytes.length != expectedBytes) {
           print(
             '[video] invalid rgba frame_id=${frame.frameId} type=${pendingFrame.messageType} width=${frame.width} height=${frame.height} rgba=${frame.rgbaBytes.length} expected=$expectedBytes dropped_reason=dimension_mismatch',
           );
           unawaited(requestResync());
           continue;
         }
+        final receiveToEmitMs =
+            DateTime.now().millisecondsSinceEpoch - frame.receivedTimestampMs;
+        _videoReceiveToEmitMs.add(receiveToEmitMs);
+        if (_pendingCompressedFrame != null &&
+            receiveToEmitMs > max(_targetFrameBudgetMs, 80) &&
+            !frame.isKeyframe) {
+          _staleDropsAfterDecode += 1;
+          if (frame.frameId % _frameLogSampleEvery == 0) {
+            print(
+              '[video] stale drop after decode frame_id=${frame.frameId} receive_to_emit_ms=$receiveToEmitMs pending_frame=${_pendingCompressedFrame!.frameId} stale_drops=$_staleDropsAfterDecode',
+            );
+          }
+          _maybeEmitVideoSummary();
+          continue;
+        }
         if (frame.frameId % _frameLogSampleEvery == 0) {
           print(
-            '[video] decoded frame_id=${frame.frameId} type=${pendingFrame.messageType} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} queue_age_ms=${frame.queueAgeMs} host_clock_age_ms=${frame.hostClockAgeMs} width=${frame.width} height=${frame.height} rgba=${frame.rgbaBytes.length} expected=$expectedBytes',
+            '[video] decoded frame_id=${frame.frameId} type=${pendingFrame.messageType} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} queue_age_ms=${frame.queueAgeMs} host_clock_age_ms=${frame.hostClockAgeMs} decode_ms=${frame.decodeMs} receive_to_decode_start_ms=${frame.receiveToDecodeStartMs} width=${frame.width} height=${frame.height} rgba=${frame.rgbaBytes.length} expected=$expectedBytes placeholder=${frame.isPlaceholder}',
           );
         }
+        _maybeEmitVideoSummary();
         if (!_videoFrames.isClosed) {
           _videoFrames.add(frame);
         }
@@ -518,7 +684,10 @@ class RemoteClient {
       return;
     }
     final readyPort = ReceivePort();
-    final isolate = await Isolate.spawn(_frameDecodeIsolateMain, readyPort.sendPort);
+    final isolate = await Isolate.spawn(
+      _frameDecodeIsolateMain,
+      readyPort.sendPort,
+    );
     final sendPort = await readyPort.first as SendPort;
     readyPort.close();
     final receivePort = ReceivePort();
@@ -534,14 +703,18 @@ class RemoteClient {
       if (requestId == null) {
         return;
       }
-      _pendingDecodeResponses.remove(requestId)?.complete(message.cast<String, Object?>());
+      _pendingDecodeResponses
+          .remove(requestId)
+          ?.complete(message.cast<String, Object?>());
     });
     _frameDecodeIsolate = isolate;
     _frameDecodeReceivePort = receivePort;
     _frameDecodeSendPort = sendPort;
   }
 
-  Future<Map<String, Object?>> _decodeFrameOnWorker(_PendingCompressedFrame frame) async {
+  Future<Map<String, Object?>> _decodeFrameOnWorker(
+    _PendingCompressedFrame frame,
+  ) async {
     await _ensureFrameDecodeIsolate();
     final requestId = _nextDecodeRequestId++;
     final completer = Completer<Map<String, Object?>>();
@@ -566,6 +739,7 @@ class RemoteClient {
     bool deltaStreamEnabled = true,
     bool audioEnabled = false,
   }) async {
+    _targetFrameBudgetMs = max(1, 1000 ~/ max(1, fps));
     await _sendControlJson(<String, Object?>{
       'type': 'settings',
       'target_width': targetWidth,
@@ -575,7 +749,8 @@ class RemoteClient {
       'monitor_index': monitorIndex,
       'clipboard_mode': clipboardMode,
       'delta_stream_enabled': deltaStreamEnabled,
-      'audio_enabled': audioEnabled,
+      'audio_enabled':
+          (audioEnabled || kDebugAudioOnlyMode) && !kDebugAudioDisabled,
     });
   }
 
@@ -609,7 +784,10 @@ class RemoteClient {
 
   Future<void> sendClipboardMode(String mode) async {
     _clipboardMode = mode;
-    await _sendControlJson(<String, Object?>{'type': 'clipboard_mode', 'mode': mode});
+    await _sendControlJson(<String, Object?>{
+      'type': 'clipboard_mode',
+      'mode': mode,
+    });
   }
 
   Future<void> stopAudioOutput() async {
@@ -627,7 +805,8 @@ class RemoteClient {
     bool Function()? shouldCancel,
   }) async {
     final digest = sha256.convert(data).toString();
-    final transferId = 'tx-${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 30)}';
+    final transferId =
+        'tx-${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 30)}';
     _activeTransferId = transferId;
     const int chunkSize = 8 * 1024;
     final totalChunks = (data.length / chunkSize).ceil();
@@ -647,7 +826,9 @@ class RemoteClient {
       const Duration(seconds: 10),
       onTimeout: () {
         _pendingTransferStarts.remove(transferId);
-        throw const SocketException('Timed out waiting for host transfer start ack');
+        throw const SocketException(
+          'Timed out waiting for host transfer start ack',
+        );
       },
     );
 
@@ -664,14 +845,18 @@ class RemoteClient {
         'file chunk transfer_id=$transferId seq=$seq offset=$i raw_len=${chunk.length} encoded_len=${encoded.length}',
       );
       final chunkAck = Completer<void>();
-      final ackMap =
-          _pendingTransferChunkAcks.putIfAbsent(transferId, () => <int, Completer<void>>{});
+      final ackMap = _pendingTransferChunkAcks.putIfAbsent(
+        transferId,
+        () => <int, Completer<void>>{},
+      );
       ackMap[seq] = chunkAck;
       const maxChunkAttempts = 3;
       var acked = false;
       for (var attempt = 1; attempt <= maxChunkAttempts; attempt++) {
         if (attempt > 1) {
-          print('retry file chunk transfer_id=$transferId seq=$seq attempt=$attempt');
+          print(
+            'retry file chunk transfer_id=$transferId seq=$seq attempt=$attempt',
+          );
         }
         await _sendControlJson(<String, Object?>{
           'type': 'file_chunk',
@@ -687,7 +872,9 @@ class RemoteClient {
         } on TimeoutException {
           if (attempt == maxChunkAttempts) {
             _pendingTransferChunkAcks[transferId]?.remove(seq);
-            throw SocketException('Timed out waiting for host chunk ack seq=$seq');
+            throw SocketException(
+              'Timed out waiting for host chunk ack seq=$seq',
+            );
           }
         }
       }
@@ -715,7 +902,10 @@ class RemoteClient {
       'transfer_id': _activeTransferId,
     });
     if (_activeTransferId != null) {
-      _failPendingTransfer(_activeTransferId!, const SocketException('cancelled'));
+      _failPendingTransfer(
+        _activeTransferId!,
+        const SocketException('cancelled'),
+      );
     }
     _activeTransferId = null;
   }
@@ -723,7 +913,9 @@ class RemoteClient {
   Future<void> sendMouseMove(double relX, double relY) async {
     final x = relX.clamp(0.0, 1.0);
     final y = relY.clamp(0.0, 1.0);
-    print('sending mouse_move rel=(${x.toStringAsFixed(3)}, ${y.toStringAsFixed(3)})');
+    print(
+      'sending mouse_move rel=(${x.toStringAsFixed(3)}, ${y.toStringAsFixed(3)})',
+    );
     await _sendControlJson(<String, Object?>{
       'type': 'mouse_move',
       'x': x,
@@ -776,7 +968,9 @@ class RemoteClient {
     if (lenBytes.isEmpty) {
       return null;
     }
-    final payloadLength = ByteData.sublistView(lenBytes).getUint32(0, Endian.big);
+    final payloadLength = ByteData.sublistView(
+      lenBytes,
+    ).getUint32(0, Endian.big);
 
     final payload = await _readExact(payloadLength);
     if (payload.isEmpty && payloadLength > 0) {
@@ -803,12 +997,7 @@ class RemoteClient {
       if (_pendingOffset < _pending.length) {
         final available = _pending.length - _pendingOffset;
         final take = min(length - written, available);
-        out.setRange(
-          written,
-          written + take,
-          _pending,
-          _pendingOffset,
-        );
+        out.setRange(written, written + take, _pending, _pendingOffset);
         written += take;
         _pendingOffset += take;
         if (_pendingOffset >= _pending.length) {
@@ -825,7 +1014,9 @@ class RemoteClient {
 
       final hasNext = await iterator.moveNext();
       if (!hasNext) {
-        throw const SocketException('Connection closed before enough data was received');
+        throw const SocketException(
+          'Connection closed before enough data was received',
+        );
       }
       _pending = iterator.current;
       _pendingOffset = 0;
@@ -835,14 +1026,17 @@ class RemoteClient {
   }
 
   int _peekFrameId(int messageType, Uint8List payload) {
-    if ((messageType == _msgVideoKeyframe || messageType == _msgVideoDelta) && payload.length >= 4) {
+    if ((messageType == _msgVideoKeyframe || messageType == _msgVideoDelta) &&
+        payload.length >= 4) {
       return ByteData.sublistView(payload).getUint32(0, Endian.big);
     }
     return 0;
   }
 
-
-  Future<void> _handleAudioPacket(Uint8List payload) async {
+  void _handleAudioPacket(Uint8List payload) {
+    if (kDebugAudioDisabled) {
+      return;
+    }
     if (payload.length < 23) {
       return;
     }
@@ -864,12 +1058,16 @@ class RemoteClient {
       return;
     }
     _audioPacketsReceived += 1;
+    final receivedTimestampMs = DateTime.now().millisecondsSinceEpoch;
+    final queueDepthAtEnqueue = _pendingAudioPackets.length + 1;
+    _audioQueueDepthStats.add(queueDepthAtEnqueue);
     print(
       '[audio] packet received count=$_audioPacketsReceived seq=$sequence pts=$ptsMs sampleRate=$sampleRate channels=$channels codec=$codec bytes=$audioLen',
     );
     if (_pendingAudioPackets.length >= _maxPendingAudioPackets) {
       final dropped = _pendingAudioPackets.removeFirst();
       _audioPacketsDropped += 1;
+      _audioLateDrops += 1;
       print(
         '[audio] late-drop seq=${dropped.sequence} queueAge=${dropped.queueAgeMs}ms totalDropped=$_audioPacketsDropped',
       );
@@ -877,11 +1075,14 @@ class RemoteClient {
     _pendingAudioPackets.addLast(
       _PendingAudioPacket(
         payload: Uint8List.fromList(payload),
-        receivedTimestampMs: DateTime.now().millisecondsSinceEpoch,
+        receivedTimestampMs: receivedTimestampMs,
+        enqueueTimestampMs: receivedTimestampMs,
         ptsMs: ptsMs,
         sequence: sequence,
+        queueDepthAtEnqueue: queueDepthAtEnqueue,
       ),
     );
+    _trimAudioQueueToLatencyBudget();
     if (!_audioDispatchRunning) {
       unawaited(_drainAudioQueue());
     }
@@ -901,25 +1102,41 @@ class RemoteClient {
         final sampleRate = data.getUint32(14, Endian.big);
         final audioLen = data.getUint32(19, Endian.big);
         final audioBytes = Uint8List.sublistView(payload, 23, 23 + audioLen);
-        if (pending.queueAgeMs > 250) {
+        if (pending.queueAgeMs > _audioMaxQueueAgeMs) {
           _audioPacketsDropped += 1;
+          _audioLateDrops += 1;
           print(
             '[audio] stale-drop seq=${pending.sequence} queueAge=${pending.queueAgeMs}ms totalDropped=$_audioPacketsDropped',
           );
+          _maybeEmitAudioSummary();
           continue;
         }
         try {
+          final submitStartMs = DateTime.now().millisecondsSinceEpoch;
           await _audioSink.playPcm16(
             sampleRate: sampleRate,
             channels: channels,
             data: audioBytes,
           );
+          final submitEndMs = DateTime.now().millisecondsSinceEpoch;
           _audioPacketsSubmitted += 1;
+          _audioReceiveToSubmitMs.add(
+            submitEndMs - pending.receivedTimestampMs,
+          );
+          if (_audioPacketsSubmitted % _frameLogSampleEvery == 0) {
+            final playbackStats = await _audioSink.getPlaybackStats();
+            final occupancyMs = (playbackStats['buffer_occupancy_ms'] as num?)
+                ?.toInt();
+            if (occupancyMs != null) {
+              _audioBufferOccupancyMs.add(occupancyMs);
+            }
+          }
           if (_audioPacketsSubmitted % _frameLogSampleEvery == 0) {
             print(
-              '[audio] playback submitted count=$_audioPacketsSubmitted seq=${pending.sequence} pts=${pending.ptsMs} sampleRate=$sampleRate channels=$channels bytes=$audioLen queue=${_pendingAudioPackets.length} dropped=$_audioPacketsDropped',
+              '[audio] playback submitted count=$_audioPacketsSubmitted seq=${pending.sequence} pts=${pending.ptsMs} sampleRate=$sampleRate channels=$channels bytes=$audioLen queue=${_pendingAudioPackets.length} enqueue_depth=${pending.queueDepthAtEnqueue} submit_ms=${submitEndMs - submitStartMs} dropped=$_audioPacketsDropped',
             );
           }
+          _maybeEmitAudioSummary();
         } catch (err) {
           _controlMessages.add(<String, dynamic>{
             'type': 'client_audio_error',
@@ -936,6 +1153,149 @@ class RemoteClient {
     }
   }
 
+  void _enqueueControlMessage(Map<String, dynamic> message) {
+    _pendingControlMessages.addLast(message);
+    if (!_controlDispatchRunning) {
+      unawaited(_drainControlQueue());
+    }
+  }
+
+  Future<void> _drainControlQueue() async {
+    if (_controlDispatchRunning) {
+      return;
+    }
+    _controlDispatchRunning = true;
+    try {
+      while (_pendingControlMessages.isNotEmpty) {
+        final next = _pendingControlMessages.removeFirst();
+        await _handleControlMessage(next);
+      }
+    } finally {
+      _controlDispatchRunning = false;
+      if (_pendingControlMessages.isNotEmpty) {
+        unawaited(_drainControlQueue());
+      }
+    }
+  }
+
+  void _recordTransportDispatch(int dispatchStartMs) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _transportDispatchMs.add(nowMs - dispatchStartMs);
+    _maybeEmitTransportSummary();
+  }
+
+  void _trimAudioQueueToLatencyBudget() {
+    while (_pendingAudioPackets.isNotEmpty &&
+        _pendingAudioPackets.first.queueAgeMs > _audioMaxQueueAgeMs) {
+      final dropped = _pendingAudioPackets.removeFirst();
+      _audioPacketsDropped += 1;
+      _audioLateDrops += 1;
+      print(
+        '[audio] age-trim drop seq=${dropped.sequence} queueAge=${dropped.queueAgeMs}ms totalDropped=$_audioPacketsDropped',
+      );
+    }
+  }
+
+  Map<String, Object?> _buildDecodeBypassFrame(_PendingCompressedFrame frame) {
+    _videoFramesDecodeBypassed += 1;
+    return <String, Object?>{
+      'frame_id': frame.frameId,
+      'width': 2,
+      'height': 2,
+      'capture_timestamp_ms': _peekCaptureTimestampMs(
+        frame.messageType,
+        frame.payload,
+      ),
+      'received_timestamp_ms': frame.receivedTimestampMs,
+      'rgba': TransferableTypedData.fromList(<TypedData>[
+        Uint8List.fromList(<int>[
+          24,
+          24,
+          24,
+          255,
+          24,
+          24,
+          24,
+          255,
+          24,
+          24,
+          24,
+          255,
+          24,
+          24,
+          24,
+          255,
+        ]),
+      ]),
+      'is_placeholder': true,
+    };
+  }
+
+  int _peekCaptureTimestampMs(int messageType, Uint8List payload) {
+    if (messageType == _msgVideoKeyframe && payload.length >= 12) {
+      return ByteData.sublistView(payload).getUint64(4, Endian.big).toInt();
+    }
+    if (messageType == _msgVideoDelta && payload.length >= 16) {
+      return ByteData.sublistView(payload).getUint64(8, Endian.big).toInt();
+    }
+    return DateTime.now().millisecondsSinceEpoch;
+  }
+
+  void _maybeEmitTransportSummary() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastTransportSummaryAtMs < _latencySummaryIntervalMs ||
+        _transportDispatchMs.isEmpty) {
+      return;
+    }
+    _lastTransportSummaryAtMs = nowMs;
+    _controlMessages.add(<String, dynamic>{
+      'type': 'client_transport_latency_summary',
+      'dispatch_avg_ms': _transportDispatchMs.averageLabel,
+      'dispatch_p95_ms': _transportDispatchMs.p95,
+    });
+  }
+
+  void _maybeEmitVideoSummary() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastVideoSummaryAtMs < _latencySummaryIntervalMs ||
+        _videoDecodeMs.isEmpty) {
+      return;
+    }
+    _lastVideoSummaryAtMs = nowMs;
+    _controlMessages.add(<String, dynamic>{
+      'type': 'client_video_latency_summary',
+      'receive_to_decode_start_avg_ms':
+          _videoReceiveToDecodeStartMs.averageLabel,
+      'receive_to_decode_start_p95_ms': _videoReceiveToDecodeStartMs.p95,
+      'decode_avg_ms': _videoDecodeMs.averageLabel,
+      'decode_p95_ms': _videoDecodeMs.p95,
+      'receive_to_emit_avg_ms': _videoReceiveToEmitMs.averageLabel,
+      'receive_to_emit_p95_ms': _videoReceiveToEmitMs.p95,
+      'frames_replaced_before_decode': _replacedCompressedFrameCount,
+      'stale_drops_after_decode': _staleDropsAfterDecode,
+      'decode_bypass_frames': _videoFramesDecodeBypassed,
+    });
+  }
+
+  void _maybeEmitAudioSummary() {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastAudioSummaryAtMs < _latencySummaryIntervalMs ||
+        _audioReceiveToSubmitMs.isEmpty) {
+      return;
+    }
+    _lastAudioSummaryAtMs = nowMs;
+    _controlMessages.add(<String, dynamic>{
+      'type': 'client_audio_latency_summary',
+      'receive_to_audio_submit_avg_ms': _audioReceiveToSubmitMs.averageLabel,
+      'receive_to_audio_submit_p95_ms': _audioReceiveToSubmitMs.p95,
+      'audio_queue_depth_avg': _audioQueueDepthStats.averageLabel,
+      'audio_queue_depth_p95': _audioQueueDepthStats.p95,
+      'audio_late_drop_count': _audioLateDrops,
+      'audio_buffer_occupancy_avg_ms': _audioBufferOccupancyMs.averageLabel,
+      'audio_buffer_occupancy_p95_ms': _audioBufferOccupancyMs.p95,
+      'audio_queue_target_ms': _audioMaxQueueAgeMs,
+    });
+  }
 
   Future<void> _handleControlMessage(Map<String, dynamic> message) async {
     final type = message['type'] as String?;
@@ -974,7 +1334,9 @@ class RemoteClient {
         } else {
           _failPendingTransfer(
             transferId,
-            SocketException(message['error'] as String? ?? 'file transfer failed'),
+            SocketException(
+              message['error'] as String? ?? 'file transfer failed',
+            ),
           );
           if (_activeTransferId == transferId) {
             _activeTransferId = null;
@@ -991,7 +1353,10 @@ class RemoteClient {
       final deviceId = message['device_id'] as String? ?? '';
       final hostNonceB64 = message['host_nonce_b64'] as String?;
       final challengeB64 = message['challenge_b64'] as String?;
-      if (pendingClientNonce == null || deviceId != identity.deviceId || hostNonceB64 == null || challengeB64 == null) {
+      if (pendingClientNonce == null ||
+          deviceId != identity.deviceId ||
+          hostNonceB64 == null ||
+          challengeB64 == null) {
         _controlMessages.add(<String, dynamic>{
           'type': 'pair_result',
           'ok': false,
@@ -999,15 +1364,12 @@ class RemoteClient {
         });
         return;
       }
-      final payload = _buildSignedPayload(
-        'AETHERLINK_PAIR_V1',
-        <Uint8List>[
-          Uint8List.fromList(utf8.encode(identity.deviceId)),
-          pendingClientNonce,
-          base64Decode(hostNonceB64),
-          base64Decode(challengeB64),
-        ],
-      );
+      final payload = _buildSignedPayload('AETHERLINK_PAIR_V1', <Uint8List>[
+        Uint8List.fromList(utf8.encode(identity.deviceId)),
+        pendingClientNonce,
+        base64Decode(hostNonceB64),
+        base64Decode(challengeB64),
+      ]);
       final signature = await _trustIdentityService.signChallenge(payload);
       await _sendControlJson(<String, Object?>{
         'type': 'pair_proof',
@@ -1037,14 +1399,11 @@ class RemoteClient {
         });
         return;
       }
-      final payload = _buildSignedPayload(
-        'AETHERLINK_AUTH_V1',
-        <Uint8List>[
-          Uint8List.fromList(utf8.encode(identity.deviceId)),
-          base64Decode(nonceB64),
-          Uint8List.fromList(utf8.encode(sessionContext)),
-        ],
-      );
+      final payload = _buildSignedPayload('AETHERLINK_AUTH_V1', <Uint8List>[
+        Uint8List.fromList(utf8.encode(identity.deviceId)),
+        base64Decode(nonceB64),
+        Uint8List.fromList(utf8.encode(sessionContext)),
+      ]);
       final signature = await _trustIdentityService.signChallenge(payload);
       await _sendControlJson(<String, Object?>{
         'type': 'trusted_auth',
@@ -1067,8 +1426,10 @@ class RemoteClient {
       }
       final text = message['text'] as String? ?? '';
       final textHash = sha256.convert(utf8.encode(text)).toString();
-      final withinSuppressionWindow = _lastAppliedClipboardAt != null &&
-          DateTime.now().difference(_lastAppliedClipboardAt!) < const Duration(seconds: 2);
+      final withinSuppressionWindow =
+          _lastAppliedClipboardAt != null &&
+          DateTime.now().difference(_lastAppliedClipboardAt!) <
+              const Duration(seconds: 2);
       if (_lastAppliedClipboardHash == textHash && withinSuppressionWindow) {
         return;
       }
@@ -1082,7 +1443,10 @@ class RemoteClient {
         _lastAppliedClipboardAt = DateTime.now();
         appliedLocally = true;
       }
-      message = <String, dynamic>{...message, 'applied_locally': appliedLocally};
+      message = <String, dynamic>{
+        ...message,
+        'applied_locally': appliedLocally,
+      };
     }
     _controlMessages.add(message);
   }
@@ -1115,7 +1479,9 @@ class RemoteClient {
 
   Uint8List _randomBytes(int length) {
     final random = Random.secure();
-    return Uint8List.fromList(List<int>.generate(length, (_) => random.nextInt(256)));
+    return Uint8List.fromList(
+      List<int>.generate(length, (_) => random.nextInt(256)),
+    );
   }
 
   bool _hasRecentClipboardSyncId(String syncId) {
@@ -1155,7 +1521,9 @@ class RemoteClient {
 
     final payload = utf8.encode(jsonEncode(sanitized));
     final type = sanitized['type']?.toString() ?? 'unknown';
-    print('SEND control type=$type len=${payload.length} transport=${relayHostId == null ? 'direct' : 'relay'}');
+    print(
+      'SEND control type=$type len=${payload.length} transport=${relayHostId == null ? 'direct' : 'relay'}',
+    );
     final header = ByteData(5)
       ..setUint8(0, _msgControlInput)
       ..setUint32(1, payload.length, Endian.big);
@@ -1201,7 +1569,9 @@ void _frameDecodeIsolateMain(SendPort readyPort) {
     final requestId = message['request_id'] as int;
     final messageType = message['message_type'] as int;
     final receivedTimestampMs = message['received_timestamp_ms'] as int;
-    final payload = (message['payload'] as TransferableTypedData).materialize().asUint8List();
+    final payload = (message['payload'] as TransferableTypedData)
+        .materialize()
+        .asUint8List();
     final response = _decodeFramePayloadInIsolate(
       frameBuffer: frameBuffer,
       currentFrameId: currentFrameId,
@@ -1246,7 +1616,10 @@ Map<String, Object?> _decodeFramePayloadInIsolate({
   return <String, Object?>{};
 }
 
-Map<String, Object?> _decodeKeyframeInIsolate(Uint8List payload, int receivedTimestampMs) {
+Map<String, Object?> _decodeKeyframeInIsolate(
+  Uint8List payload,
+  int receivedTimestampMs,
+) {
   final data = ByteData.sublistView(payload);
   if (payload.length < 25) {
     return <String, Object?>{'drop_reason': 'short_keyframe'};
@@ -1258,12 +1631,18 @@ Map<String, Object?> _decodeKeyframeInIsolate(Uint8List payload, int receivedTim
   final codec = data.getUint8(20);
   final imageLen = data.getUint32(21, Endian.big);
   if (payload.length < 25 + imageLen) {
-    return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_keyframe'};
+    return <String, Object?>{
+      'frame_id': frameId,
+      'drop_reason': 'truncated_keyframe',
+    };
   }
   final imageBytes = payload.sublist(25, 25 + imageLen);
   final decoded = _decodeImageInIsolate(codec, imageBytes);
   if (decoded == null) {
-    return <String, Object?>{'frame_id': frameId, 'drop_reason': 'decode_failed'};
+    return <String, Object?>{
+      'frame_id': frameId,
+      'drop_reason': 'decode_failed',
+    };
   }
   if (decoded.width != width || decoded.height != height) {
     return <String, Object?>{
@@ -1271,7 +1650,9 @@ Map<String, Object?> _decodeKeyframeInIsolate(Uint8List payload, int receivedTim
       'drop_reason': 'decoded_dimension_mismatch',
     };
   }
-  final rgba = Uint8List.fromList(decoded.getBytes(order: img.ChannelOrder.rgba));
+  final rgba = Uint8List.fromList(
+    decoded.getBytes(order: img.ChannelOrder.rgba),
+  );
   final expectedBytes = width * height * 4;
   if (rgba.length != expectedBytes) {
     return <String, Object?>{
@@ -1322,7 +1703,10 @@ Map<String, Object?> _decodeDeltaInIsolate({
   var offset = 28;
   for (var i = 0; i < moveCount; i += 1) {
     if (payload.length < offset + 24) {
-      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_move'};
+      return <String, Object?>{
+        'frame_id': frameId,
+        'drop_reason': 'truncated_move',
+      };
     }
     final srcX = data.getInt32(offset, Endian.big);
     final srcY = data.getInt32(offset + 4, Endian.big);
@@ -1344,7 +1728,10 @@ Map<String, Object?> _decodeDeltaInIsolate({
 
   for (var i = 0; i < patchCount; i += 1) {
     if (payload.length < offset + 21) {
-      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_patch_header'};
+      return <String, Object?>{
+        'frame_id': frameId,
+        'drop_reason': 'truncated_patch_header',
+      };
     }
     final x = data.getInt32(offset, Endian.big);
     final y = data.getInt32(offset + 4, Endian.big);
@@ -1361,7 +1748,10 @@ Map<String, Object?> _decodeDeltaInIsolate({
       };
     }
     if (payload.length < offset + imageLen) {
-      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_patch_data'};
+      return <String, Object?>{
+        'frame_id': frameId,
+        'drop_reason': 'truncated_patch_data',
+      };
     }
     final patchBytes = payload.sublist(offset, offset + imageLen);
     offset += imageLen;
@@ -1375,7 +1765,9 @@ Map<String, Object?> _decodeDeltaInIsolate({
     _applyPatchInIsolate(frameBuffer, patch, x, y, width, height);
   }
 
-  final rgba = Uint8List.fromList(frameBuffer.getBytes(order: img.ChannelOrder.rgba));
+  final rgba = Uint8List.fromList(
+    frameBuffer.getBytes(order: img.ChannelOrder.rgba),
+  );
   final expectedBytes = frameWidth * frameHeight * 4;
   if (rgba.length != expectedBytes) {
     return <String, Object?>{
@@ -1405,7 +1797,14 @@ img.Image? _decodeImageInIsolate(int codec, Uint8List bytes) {
   }
 }
 
-void _applyPatchInIsolate(img.Image target, img.Image patch, int x, int y, int width, int height) {
+void _applyPatchInIsolate(
+  img.Image target,
+  img.Image patch,
+  int x,
+  int y,
+  int width,
+  int height,
+) {
   final normalizedPatch = (patch.width == width && patch.height == height)
       ? patch
       : img.copyResize(patch, width: width, height: height);
@@ -1421,22 +1820,26 @@ void _applyMoveInIsolate(
   int width,
   int height,
 ) {
-  final copy = img.copyCrop(target, x: srcX, y: srcY, width: width, height: height);
+  final copy = img.copyCrop(
+    target,
+    x: srcX,
+    y: srcY,
+    width: width,
+    height: height,
+  );
   img.compositeImage(target, copy, dstX: dstX, dstY: dstY);
 }
 
-bool _rectWithinFrame(int x, int y, int width, int height, int frameWidth, int frameHeight) {
+bool _rectWithinFrame(
+  int x,
+  int y,
+  int width,
+  int height,
+  int frameWidth,
+  int frameHeight,
+) {
   if (x < 0 || y < 0 || width <= 0 || height <= 0) {
     return false;
   }
   return x + width <= frameWidth && y + height <= frameHeight;
 }
-
-
-
-
-
-
-
-
-
