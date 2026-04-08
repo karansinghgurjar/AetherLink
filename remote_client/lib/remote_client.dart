@@ -201,6 +201,7 @@ class RemoteClient {
     }
 
     final socket = await _connectSocket();
+    socket.setOption(SocketOption.tcpNoDelay, true);
 
     final peerCert = socket.peerCertificate;
     if (relayHostId == null &&
