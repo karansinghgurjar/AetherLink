@@ -29,6 +29,10 @@ class MainActivity : FlutterActivity() {
     private var activeSampleRate: Int? = null
     @Volatile
     private var activeChannels: Int? = null
+    @Volatile
+    private var activeBufferSizeBytes: Int = 0
+    @Volatile
+    private var totalBytesWritten: Long = 0
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -54,11 +58,17 @@ class MainActivity : FlutterActivity() {
                         }
                         audioExecutor.execute {
                             try {
-                                audioTrack?.write(data, 0, data.size, AudioTrack.WRITE_BLOCKING)
+                                val written = audioTrack?.write(data, 0, data.size, AudioTrack.WRITE_BLOCKING) ?: 0
+                                if (written > 0) {
+                                    totalBytesWritten += written.toLong()
+                                }
                             } catch (_: Exception) {
                             }
                         }
                         result.success(null)
+                    }
+                    "getPlaybackStats" -> {
+                        result.success(getPlaybackStats())
                     }
                     "stopAudio" -> {
                         stopAudio()
@@ -110,7 +120,7 @@ class MainActivity : FlutterActivity() {
             channelConfig,
             AudioFormat.ENCODING_PCM_16BIT,
         )
-        val bufferSize = if (minBufferSize > 0) minBufferSize * 4 else sampleRate * channels * 2
+        val bufferSize = if (minBufferSize > 0) minBufferSize * 2 else sampleRate * channels * 2
 
         val current = audioTrack
         if (current != null) {
@@ -146,6 +156,8 @@ class MainActivity : FlutterActivity() {
         audioTrack = track
         activeSampleRate = sampleRate
         activeChannels = channels
+        activeBufferSizeBytes = bufferSize
+        totalBytesWritten = 0
     }
 
     private fun stopAudio() {
@@ -153,6 +165,8 @@ class MainActivity : FlutterActivity() {
         audioTrack = null
         activeSampleRate = null
         activeChannels = null
+        activeBufferSizeBytes = 0
+        totalBytesWritten = 0
         audioExecutor.execute {
             try {
                 track.pause()
@@ -165,6 +179,29 @@ class MainActivity : FlutterActivity() {
             }
             track.release()
         }
+    }
+
+    private fun getPlaybackStats(): Map<String, Any> {
+        val track = audioTrack
+        val sampleRate = activeSampleRate ?: 0
+        val channels = activeChannels ?: 0
+        val bytesPerFrame = if (channels > 0) channels * 2 else 0
+        val playbackHeadFrames = track?.playbackHeadPosition?.toLong() ?: 0L
+        val writtenFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0L
+        val occupancyFrames = (writtenFrames - playbackHeadFrames).coerceAtLeast(0L)
+        val occupancyMs = if (sampleRate > 0) (occupancyFrames * 1000L) / sampleRate else 0L
+        val underrunCount =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && track != null) track.underrunCount else -1
+        return mapOf(
+            "sample_rate" to sampleRate,
+            "channels" to channels,
+            "buffer_size_bytes" to activeBufferSizeBytes,
+            "playback_head_frames" to playbackHeadFrames,
+            "written_frames" to writtenFrames,
+            "buffer_occupancy_frames" to occupancyFrames,
+            "buffer_occupancy_ms" to occupancyMs,
+            "underrun_count" to underrunCount,
+        )
     }
 
     private fun trustPrefs() = getSharedPreferences("aetherlink_trust", Context.MODE_PRIVATE)
