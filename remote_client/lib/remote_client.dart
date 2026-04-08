@@ -21,6 +21,9 @@ const int _msgAudioPacket = 0x05;
 const int _codecJpeg = 0x01;
 const int _audioCodecPcmS16Le = 0x00;
 const int _frameLogSampleEvery = 30;
+const bool kDebugAudioOnlyMode = bool.fromEnvironment('AETHERLINK_AUDIO_ONLY_MODE', defaultValue: false);
+const bool kDisableStartupStaleDrop =
+    bool.fromEnvironment('AETHERLINK_DISABLE_STARTUP_STALE_DROP', defaultValue: false);
 
 class RemoteVideoFrame {
   const RemoteVideoFrame({
@@ -41,7 +44,8 @@ class RemoteVideoFrame {
   final int receivedTimestampMs;
   final int messageType;
 
-  int get ageMs => DateTime.now().millisecondsSinceEpoch - captureTimestampMs;
+  int get queueAgeMs => DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
+  int get hostClockAgeMs => DateTime.now().millisecondsSinceEpoch - captureTimestampMs;
 
   bool get isKeyframe => messageType == _msgVideoKeyframe;
 }
@@ -120,6 +124,7 @@ class _AndroidAudioSink {
         'sampleRate': sampleRate,
         'channels': channels,
       });
+      print('[audio] playback started sampleRate=$sampleRate channels=$channels');
       _started = true;
       _sampleRate = sampleRate;
       _channels = channels;
@@ -134,6 +139,7 @@ class _AndroidAudioSink {
       return;
     }
     await _channel.invokeMethod<void>('stopAudio');
+    print('[audio] playback stopped');
     _started = false;
     _sampleRate = null;
     _channels = null;
@@ -176,6 +182,10 @@ class RemoteClient {
   bool _decodeLoopRunning = false;
   _PendingCompressedFrame? _pendingCompressedFrame;
   int _replacedCompressedFrameCount = 0;
+  final Queue<Uint8List> _pendingAudioPackets = Queue<Uint8List>();
+  bool _audioDispatchRunning = false;
+  int _audioPacketsReceived = 0;
+  int _audioPacketsSubmitted = 0;
 
   RemoteClient({
     required this.host,
@@ -302,6 +312,8 @@ class RemoteClient {
     _lastAppliedClipboardHash = null;
     _lastAppliedClipboardAt = null;
     _pendingCompressedFrame = null;
+    _pendingAudioPackets.clear();
+    _audioDispatchRunning = false;
     _readLoopRunning = false;
     _decodeLoopRunning = false;
     for (final pending in _pendingDecodeResponses.values) {
@@ -354,12 +366,20 @@ class RemoteClient {
             continue;
           }
           if (message.$1 == _msgAudioPacket) {
+            _controlMessages.add(<String, dynamic>{
+              'type': 'client_audio_packet',
+            });
             await _handleAudioPacket(message.$2);
             continue;
           }
           if (message.$1 == _msgVideoFrame ||
               message.$1 == _msgVideoKeyframe ||
               message.$1 == _msgVideoDelta) {
+            _controlMessages.add(<String, dynamic>{
+              'type': 'client_video_packet',
+              'message_type': message.$1,
+              'payload_len': message.$2.length,
+            });
             _enqueueCompressedFrame(message.$1, message.$2);
           }
         }
@@ -369,14 +389,14 @@ class RemoteClient {
         }
       } finally {
         _readLoopRunning = false;
-        if (!_videoFrames.isClosed) {
-          await _videoFrames.close();
-        }
       }
     }());
   }
 
   void _enqueueCompressedFrame(int messageType, Uint8List payload) {
+    if (kDebugAudioOnlyMode) {
+      return;
+    }
     final frameId = _peekFrameId(messageType, payload);
     final receivedTimestampMs = DateTime.now().millisecondsSinceEpoch;
     if (_pendingCompressedFrame != null) {
@@ -415,7 +435,11 @@ class RemoteClient {
           print(
             'video frame dropped frame_id=${pendingFrame.frameId} dropped_reason=${decoded['drop_reason'] ?? 'resync_required'}',
           );
-          unawaited(requestResync());
+          _controlMessages.add(<String, dynamic>{
+            'type': 'client_resync_needed',
+            'reason': decoded['drop_reason'] ?? 'resync_required',
+            'frame_id': pendingFrame.frameId,
+          });
           continue;
         }
         final rgbaData = decoded['rgba'] as TransferableTypedData?;
@@ -431,9 +455,17 @@ class RemoteClient {
           receivedTimestampMs: decoded['received_timestamp_ms'] as int,
           messageType: pendingFrame.messageType,
         );
+        final expectedBytes = frame.width * frame.height * 4;
+        if (frame.width <= 0 || frame.height <= 0 || frame.rgbaBytes.length != expectedBytes) {
+          print(
+            '[video] invalid rgba frame_id=${frame.frameId} type=${pendingFrame.messageType} width=${frame.width} height=${frame.height} rgba=${frame.rgbaBytes.length} expected=$expectedBytes dropped_reason=dimension_mismatch',
+          );
+          unawaited(requestResync());
+          continue;
+        }
         if (frame.frameId % _frameLogSampleEvery == 0) {
           print(
-            'video frame decoded frame_id=${frame.frameId} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} age_ms=${frame.ageMs} width=${frame.width} height=${frame.height}',
+            '[video] decoded frame_id=${frame.frameId} type=${pendingFrame.messageType} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} queue_age_ms=${frame.queueAgeMs} host_clock_age_ms=${frame.hostClockAgeMs} width=${frame.width} height=${frame.height} rgba=${frame.rgbaBytes.length} expected=$expectedBytes',
           );
         }
         if (!_videoFrames.isClosed) {
@@ -717,6 +749,12 @@ class RemoteClient {
     if (payload.isEmpty && payloadLength > 0) {
       return null;
     }
+    if (messageType == _msgAudioPacket ||
+        messageType == _msgVideoKeyframe ||
+        messageType == _msgVideoDelta ||
+        messageType == _msgControlInput) {
+      print('[rx] packet type=$messageType len=$payloadLength');
+    }
     return (messageType, payload);
   }
 
@@ -790,21 +828,54 @@ class RemoteClient {
       });
       return;
     }
-    final audioBytes = Uint8List.sublistView(payload, 23, 23 + audioLen);
+    _audioPacketsReceived += 1;
     print(
-      'audio packet received sampleRate=$sampleRate channels=$channels codec=$codec bytes=$audioLen',
+      '[audio] packet received count=$_audioPacketsReceived sampleRate=$sampleRate channels=$channels codec=$codec bytes=$audioLen',
     );
+    _pendingAudioPackets.addLast(Uint8List.fromList(payload));
+    if (!_audioDispatchRunning) {
+      unawaited(_drainAudioQueue());
+    }
+  }
+
+  Future<void> _drainAudioQueue() async {
+    if (_audioDispatchRunning) {
+      return;
+    }
+    _audioDispatchRunning = true;
     try {
-      await _audioSink.playPcm16(
-        sampleRate: sampleRate,
-        channels: channels,
-        data: audioBytes,
-      );
-    } catch (err) {
-      _controlMessages.add(<String, dynamic>{
-        'type': 'client_audio_error',
-        'message': err.toString(),
-      });
+      while (_pendingAudioPackets.isNotEmpty) {
+        final payload = _pendingAudioPackets.removeFirst();
+        final data = ByteData.sublistView(payload);
+        final channels = data.getUint16(12, Endian.big);
+        final sampleRate = data.getUint32(14, Endian.big);
+        final audioLen = data.getUint32(19, Endian.big);
+        final audioBytes = Uint8List.sublistView(payload, 23, 23 + audioLen);
+        try {
+          await _audioSink.playPcm16(
+            sampleRate: sampleRate,
+            channels: channels,
+            data: audioBytes,
+          );
+          _audioPacketsSubmitted += 1;
+          if (_audioPacketsSubmitted % _frameLogSampleEvery == 0) {
+            print(
+              '[audio] playback submitted count=$_audioPacketsSubmitted sampleRate=$sampleRate channels=$channels bytes=$audioLen queue=${_pendingAudioPackets.length}',
+            );
+          }
+        } catch (err) {
+          _controlMessages.add(<String, dynamic>{
+            'type': 'client_audio_error',
+            'message': err.toString(),
+          });
+          print('[audio] playback error $err');
+        }
+      }
+    } finally {
+      _audioDispatchRunning = false;
+      if (_pendingAudioPackets.isNotEmpty) {
+        unawaited(_drainAudioQueue());
+      }
     }
   }
 
@@ -1137,15 +1208,27 @@ Map<String, Object?> _decodeKeyframeInIsolate(Uint8List payload, int receivedTim
   if (decoded == null) {
     return <String, Object?>{'frame_id': frameId, 'drop_reason': 'decode_failed'};
   }
+  if (decoded.width != width || decoded.height != height) {
+    return <String, Object?>{
+      'frame_id': frameId,
+      'drop_reason': 'decoded_dimension_mismatch',
+    };
+  }
+  final rgba = Uint8List.fromList(decoded.getBytes(order: img.ChannelOrder.rgba));
+  final expectedBytes = width * height * 4;
+  if (rgba.length != expectedBytes) {
+    return <String, Object?>{
+      'frame_id': frameId,
+      'drop_reason': 'rgba_length_mismatch',
+    };
+  }
   return <String, Object?>{
     'frame_id': frameId,
     'width': width,
     'height': height,
     'capture_timestamp_ms': captureTimestampMs,
     'received_timestamp_ms': receivedTimestampMs,
-    'rgba': TransferableTypedData.fromList(<TypedData>[
-      Uint8List.fromList(decoded.getBytes(order: img.ChannelOrder.rgba)),
-    ]),
+    'rgba': TransferableTypedData.fromList(<TypedData>[rgba]),
     'frame_buffer': decoded,
   };
 }
@@ -1190,6 +1273,14 @@ Map<String, Object?> _decodeDeltaInIsolate({
     final dstY = data.getInt32(offset + 12, Endian.big);
     final width = data.getUint32(offset + 16, Endian.big);
     final height = data.getUint32(offset + 20, Endian.big);
+    if (!_rectWithinFrame(srcX, srcY, width, height, frameWidth, frameHeight) ||
+        !_rectWithinFrame(dstX, dstY, width, height, frameWidth, frameHeight)) {
+      return <String, Object?>{
+        'frame_id': frameId,
+        'request_resync': true,
+        'drop_reason': 'move_bounds_mismatch',
+      };
+    }
     _applyMoveInIsolate(frameBuffer, srcX, srcY, dstX, dstY, width, height);
     offset += 24;
   }
@@ -1205,6 +1296,13 @@ Map<String, Object?> _decodeDeltaInIsolate({
     final codec = data.getUint8(offset + 16);
     final imageLen = data.getUint32(offset + 17, Endian.big);
     offset += 21;
+    if (!_rectWithinFrame(x, y, width, height, frameWidth, frameHeight)) {
+      return <String, Object?>{
+        'frame_id': frameId,
+        'request_resync': true,
+        'drop_reason': 'patch_bounds_mismatch',
+      };
+    }
     if (payload.length < offset + imageLen) {
       return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_patch_data'};
     }
@@ -1214,7 +1312,20 @@ Map<String, Object?> _decodeDeltaInIsolate({
     if (patch == null) {
       continue;
     }
+    if (patch.width <= 0 || patch.height <= 0) {
+      continue;
+    }
     _applyPatchInIsolate(frameBuffer, patch, x, y, width, height);
+  }
+
+  final rgba = Uint8List.fromList(frameBuffer.getBytes(order: img.ChannelOrder.rgba));
+  final expectedBytes = frameWidth * frameHeight * 4;
+  if (rgba.length != expectedBytes) {
+    return <String, Object?>{
+      'frame_id': frameId,
+      'request_resync': true,
+      'drop_reason': 'delta_rgba_length_mismatch',
+    };
   }
 
   return <String, Object?>{
@@ -1223,9 +1334,7 @@ Map<String, Object?> _decodeDeltaInIsolate({
     'height': frameHeight,
     'capture_timestamp_ms': captureTimestampMs,
     'received_timestamp_ms': receivedTimestampMs,
-    'rgba': TransferableTypedData.fromList(<TypedData>[
-      Uint8List.fromList(frameBuffer.getBytes(order: img.ChannelOrder.rgba)),
-    ]),
+    'rgba': TransferableTypedData.fromList(<TypedData>[rgba]),
     'frame_buffer': frameBuffer,
   };
 }
@@ -1257,6 +1366,13 @@ void _applyMoveInIsolate(
 ) {
   final copy = img.copyCrop(target, x: srcX, y: srcY, width: width, height: height);
   img.compositeImage(target, copy, dstX: dstX, dstY: dstY);
+}
+
+bool _rectWithinFrame(int x, int y, int width, int height, int frameWidth, int frameHeight) {
+  if (x < 0 || y < 0 || width <= 0 || height <= 0) {
+    return false;
+  }
+  return x + width <= frameWidth && y + height <= frameHeight;
 }
 
 
