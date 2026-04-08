@@ -74,9 +74,9 @@ enum StreamPhase {
 }
 
 class _SettingsState {
-  ResolutionPreset resolution = ResolutionPreset.medium;
-  int fps = 15;
-  double jpegQuality = 60;
+  ResolutionPreset resolution = ResolutionPreset.low;
+  int fps = 12;
+  double jpegQuality = 50;
   bool viewOnly = false;
   int monitorIndex = 0;
   ClipboardSyncMode clipboardMode = ClipboardSyncMode.manual;
@@ -86,7 +86,7 @@ class _SettingsState {
   int get targetWidth {
     switch (resolution) {
       case ResolutionPreset.low:
-        return 854;
+        return 720;
       case ResolutionPreset.medium:
         return 960;
       case ResolutionPreset.high:
@@ -166,8 +166,8 @@ class SavedHostEntry {
         (value) => value.name == (json['resolution'] as String?),
         orElse: () => ResolutionPreset.low,
       ),
-      fps: (json['fps'] as num?)?.toInt() ?? 15,
-      jpegQuality: (json['jpeg_quality'] as num?)?.toDouble() ?? 60,
+      fps: (json['fps'] as num?)?.toInt() ?? 12,
+      jpegQuality: (json['jpeg_quality'] as num?)?.toDouble() ?? 50,
       viewOnly: json['view_only'] == true,
       monitorIndex: (json['monitor_index'] as num?)?.toInt() ?? 0,
       autoReconnect: json['auto_reconnect'] != false,
@@ -366,12 +366,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   int _streamLastPatchCount = 0;
   int _streamLastMoveCount = 0;
   double _streamLastChangedRatio = 0;
+  int _streamVideoFramesReplacedBeforeSend = 0;
+  int _streamAudioPacketsSent = 0;
   bool _manualDisconnectRequested = false;
   List<int> _availableMonitorIndexes = const <int>[0, 1, 2, 3];
   Map<int, String> _monitorLabels = const <int, String>{};
   List<String> _clientLogs = <String>[];
   ConnectionStage _connectionStage = ConnectionStage.idle;
   DateTime? _lastFrameAt;
+  DateTime? _lastVideoPacketAt;
+  DateTime? _lastAudioPacketAt;
+  DateTime? _lastControlAt;
   bool _hasRenderedFrame = false;
   int _lastRenderedFrameAgeMs = 0;
   String? _lastViewportSignature;
@@ -1012,6 +1017,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _hasRenderedFrame = false;
         _streamPhase = StreamPhase.connecting;
         _awaitingResyncKeyframe = false;
+        _lastFrameAt = null;
+        _lastVideoPacketAt = null;
+        _lastAudioPacketAt = null;
+        _lastControlAt = null;
+        _lastSessionActivityAt = null;
         if (!_connecting && !_reconnecting) {
           _connectionStage = manual ? ConnectionStage.stopped : ConnectionStage.disconnected;
         }
@@ -1037,7 +1047,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       'Health timer started (${_useRelayMode ? 'relay' : 'direct'}) startup_threshold=${_startupHealthTimeout.inSeconds}s steady_threshold=${(_useRelayMode ? _relayHealthTimeout : _directHealthTimeout).inSeconds}s',
     );
     _healthTimer = Timer.periodic(_healthPollInterval, (_) async {
-      final lastActivityAt = _lastSessionActivityAt ?? _lastFrameAt;
       if (!_connected) {
         return;
       }
@@ -1046,7 +1055,19 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       final threshold = _hasRenderedFrame
           ? (_useRelayMode ? _relayHealthTimeout : _directHealthTimeout)
           : _startupHealthTimeout;
-      final baselineAt = lastActivityAt ?? _connectStartedAt;
+      final baselineAt = <DateTime?>[
+        _lastVideoPacketAt,
+        if (_settings.audioEnabled) _lastAudioPacketAt,
+        _lastFrameAt,
+        _lastControlAt,
+        _lastSessionActivityAt,
+        _connectStartedAt,
+      ].whereType<DateTime>().fold<DateTime?>(null, (latest, value) {
+        if (latest == null || value.isAfter(latest)) {
+          return value;
+        }
+        return latest;
+      });
       if (baselineAt == null) {
         return;
       }
@@ -1056,6 +1077,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       if (!stale) {
         return;
       }
+
+      final videoAge = _lastVideoPacketAt == null ? null : now.difference(_lastVideoPacketAt!);
+      final audioAge = _lastAudioPacketAt == null ? null : now.difference(_lastAudioPacketAt!);
+      final renderAge = _lastFrameAt == null ? null : now.difference(_lastFrameAt!);
+      final controlAge = _lastControlAt == null ? null : now.difference(_lastControlAt!);
+      _recordLog(
+        'Health decision: stale=true phase=${_streamPhase.name} idle=${idleFor.inSeconds}s videoAge=${videoAge?.inSeconds ?? -1}s audioAge=${audioAge?.inSeconds ?? -1}s renderAge=${renderAge?.inSeconds ?? -1}s controlAge=${controlAge?.inSeconds ?? -1}s',
+      );
 
       if (!_hasRenderedFrame) {
         _recordLog(
@@ -1598,6 +1627,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return;
     }
     final type = message['type'];
+    _lastControlAt = DateTime.now();
     _markSessionActivity('control:$type');
     if (type == 'monitor_inventory') {
       final monitors = (message['monitors'] as List<dynamic>? ?? const <dynamic>[]);
@@ -1638,8 +1668,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         }
         if (targetWidth != null) {
           _settings.resolution = switch (targetWidth) {
-            <= 960 => ResolutionPreset.low,
-            <= 1280 => ResolutionPreset.medium,
+            <= 720 => ResolutionPreset.low,
+            <= 960 => ResolutionPreset.medium,
             _ => ResolutionPreset.high,
           };
         }
@@ -1677,16 +1707,23 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _streamLastPatchCount = (message['last_patch_count'] as num?)?.toInt() ?? _streamLastPatchCount;
         _streamLastMoveCount = (message['last_move_count'] as num?)?.toInt() ?? _streamLastMoveCount;
         _streamLastChangedRatio = (message['last_changed_ratio'] as num?)?.toDouble() ?? _streamLastChangedRatio;
+        _streamVideoFramesReplacedBeforeSend =
+            (message['video_frames_replaced_before_send'] as num?)?.toInt() ??
+            _streamVideoFramesReplacedBeforeSend;
+        _streamAudioPacketsSent =
+            (message['audio_packets_sent'] as num?)?.toInt() ?? _streamAudioPacketsSent;
       });
       return;
     }
 
     if (type == 'client_video_packet') {
+      _lastVideoPacketAt = DateTime.now();
       _markSessionActivity('video_packet');
       return;
     }
 
     if (type == 'client_audio_packet') {
+      _lastAudioPacketAt = DateTime.now();
       _markSessionActivity('audio_packet');
       return;
     }
@@ -2265,6 +2302,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             Text('Trust: ${_trustStateLabel(_trustState)}${_trustedDeviceId == null ? '' : ' (${_truncate(_trustedDeviceId!, 18)})'}'),
             Text('Auto reconnect: ${_autoReconnectEnabled ? 'on' : 'off'}'),
             Text('Reconnect attempts: $_reconnectAttempt/${_reconnectBackoffSeconds.length}'),
+            Text('Stream stats: keyframes=$_streamKeyframesSent deltas=$_streamDeltaFramesSent resyncs=$_streamResyncRequests video_replaced=$_streamVideoFramesReplacedBeforeSend audio_sent=$_streamAudioPacketsSent'),
+            Text('Last delta stats: moves=$_streamLastMoveCount patches=$_streamLastPatchCount changed=${(_streamLastChangedRatio * 100).toStringAsFixed(1)}%'),
             if (_hostClipboardText != null) Text('Host clipboard: ${_truncate(_hostClipboardText!, 60)}'),
             if (_lastError != null) Text('Last error: $_lastError'),
             const SizedBox(height: 8),
@@ -2428,7 +2467,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               initialValue: _settings.resolution,
               decoration: const InputDecoration(labelText: 'Resolution Preset'),
               items: const [
-                DropdownMenuItem(value: ResolutionPreset.low, child: Text('Responsive (854)')),
+                DropdownMenuItem(value: ResolutionPreset.low, child: Text('Responsive+ (720)')),
                 DropdownMenuItem(value: ResolutionPreset.medium, child: Text('Balanced (960)')),
                 DropdownMenuItem(value: ResolutionPreset.high, child: Text('Quality (1280)')),
               ],
@@ -2443,7 +2482,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             DropdownButtonFormField<int>(
               initialValue: _settings.fps,
               decoration: const InputDecoration(labelText: 'FPS'),
-              items: const [10, 15, 20, 30]
+              items: const [10, 12, 15, 20, 30]
                   .map((v) => DropdownMenuItem<int>(value: v, child: Text('$v')))
                   .toList(),
               onChanged: (value) {
