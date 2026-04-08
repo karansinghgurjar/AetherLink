@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -67,7 +68,7 @@ enum TrustState {
 }
 
 class _SettingsState {
-  ResolutionPreset resolution = ResolutionPreset.low;
+  ResolutionPreset resolution = ResolutionPreset.medium;
   int fps = 15;
   double jpegQuality = 60;
   bool viewOnly = false;
@@ -79,11 +80,11 @@ class _SettingsState {
   int get targetWidth {
     switch (resolution) {
       case ResolutionPreset.low:
-        return 960;
+        return 854;
       case ResolutionPreset.medium:
-        return 1280;
+        return 960;
       case ResolutionPreset.high:
-        return 1920;
+        return 1280;
     }
   }
 }
@@ -174,6 +175,97 @@ class SavedHostEntry {
   }
 }
 
+class _LatestFramePresenter {
+  _LatestFramePresenter({
+    required this.onLog,
+    required this.onPresented,
+  });
+
+  static const int staleFrameThresholdMs = 200;
+
+  final void Function(String message) onLog;
+  final void Function(RemoteVideoFrame frame, int renderedAgeMs) onPresented;
+  final ValueNotifier<ui.Image?> imageListenable = ValueNotifier<ui.Image?>(null);
+
+  RemoteVideoFrame? _pendingFrame;
+  bool _rendering = false;
+  int _replacedPendingCount = 0;
+
+  void submit(RemoteVideoFrame frame) {
+    if (frame.ageMs > staleFrameThresholdMs) {
+      onLog('Render stale-frame drop: frame ${frame.frameId} age=${frame.ageMs}ms');
+      return;
+    }
+    if (_rendering) {
+      if (_pendingFrame != null) {
+        _replacedPendingCount += 1;
+        if (frame.frameId % 30 == 0) {
+          onLog(
+            'Render backlog replace: old ${_pendingFrame!.frameId} -> new ${frame.frameId} total=$_replacedPendingCount',
+          );
+        }
+      }
+      _pendingFrame = frame;
+      return;
+    }
+    _renderLatest(frame);
+  }
+
+  void clear() {
+    _pendingFrame = null;
+    _rendering = false;
+    final previous = imageListenable.value;
+    imageListenable.value = null;
+    previous?.dispose();
+  }
+
+  void dispose() {
+    clear();
+    imageListenable.dispose();
+  }
+
+  void _renderLatest(RemoteVideoFrame frame) {
+    _rendering = true;
+    final renderStartMs = DateTime.now().millisecondsSinceEpoch;
+    ui.decodeImageFromPixels(
+      frame.rgbaBytes,
+      frame.width,
+      frame.height,
+      ui.PixelFormat.rgba8888,
+      (ui.Image image) {
+        final renderedAgeMs = DateTime.now().millisecondsSinceEpoch - frame.captureTimestampMs;
+        if (renderedAgeMs > staleFrameThresholdMs) {
+          image.dispose();
+          onLog('Render stale-frame drop: frame ${frame.frameId} age=${renderedAgeMs}ms after decode');
+          _rendering = false;
+          _drainPending();
+          return;
+        }
+        final previous = imageListenable.value;
+        imageListenable.value = image;
+        previous?.dispose();
+        if (frame.frameId % 30 == 0) {
+          onLog(
+            'Render submitted: frame ${frame.frameId} age=${renderedAgeMs}ms renderWait=${DateTime.now().millisecondsSinceEpoch - renderStartMs}ms',
+          );
+        }
+        onPresented(frame, renderedAgeMs);
+        _rendering = false;
+        _drainPending();
+      },
+      rowBytes: frame.width * 4,
+    );
+  }
+
+  void _drainPending() {
+    final nextFrame = _pendingFrame;
+    _pendingFrame = null;
+    if (nextFrame != null) {
+      submit(nextFrame);
+    }
+  }
+}
+
 class RemoteHomePage extends StatefulWidget {
   const RemoteHomePage({super.key});
 
@@ -218,13 +310,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   final _settings = _SettingsState();
 
   RemoteClient? _remoteClient;
-  StreamSubscription<Uint8List>? _frameSubscription;
+  StreamSubscription<RemoteVideoFrame>? _frameSubscription;
   StreamSubscription<Map<String, dynamic>>? _controlSubscription;
   Timer? _healthTimer;
+  late final _LatestFramePresenter _framePresenter;
 
   List<SavedHostEntry> _savedHosts = const [];
   String? _selectedSavedHostLabel;
-  Uint8List? _frame;
   String? _message;
   String? _lastError;
   bool _connecting = false;
@@ -257,13 +349,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   List<String> _clientLogs = <String>[];
   ConnectionStage _connectionStage = ConnectionStage.idle;
   DateTime? _lastFrameAt;
-  DateTime? _lastUiFrameAt;
+  bool _hasRenderedFrame = false;
+  int _lastRenderedFrameAgeMs = 0;
   DateTime? _lastSessionActivityAt;
   DateTime? _lastResyncRequestAt;
 
   @override
   void initState() {
     super.initState();
+    _framePresenter = _LatestFramePresenter(
+      onLog: _recordLog,
+      onPresented: _handlePresentedFrame,
+    );
     unawaited(_loadSavedHosts());
     unawaited(_loadClientPrefs());
     unawaited(_bootstrapTrustIdentity());
@@ -274,6 +371,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _healthTimer?.cancel();
     _frameSubscription?.cancel();
     _controlSubscription?.cancel();
+    _framePresenter.dispose();
     _remoteClient?.close();
     _hostController.dispose();
     _portController.dispose();
@@ -281,6 +379,27 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _relayHostIdController.dispose();
     _relayTokenController.dispose();
     super.dispose();
+  }
+
+  void _handlePresentedFrame(RemoteVideoFrame frame, int renderedAgeMs) {
+    if (!mounted) {
+      return;
+    }
+    final firstPresentedFrame = !_hasRenderedFrame;
+    _hasRenderedFrame = true;
+    _connected = true;
+    _connectionStage = ConnectionStage.connected;
+    _reconnectAttempt = 0;
+    _lastRenderedFrameAgeMs = renderedAgeMs;
+    _message = _useRelayMode
+        ? 'Connected via relay to ${_relayHostIdController.text.trim()}'
+        : 'Connected to ${_hostController.text.trim()}:${int.tryParse(_portController.text) ?? 0}';
+    if (firstPresentedFrame || frame.frameId % 10 == 0) {
+      setState(() {});
+    }
+    if (firstPresentedFrame) {
+      _recordLog(_message ?? 'Connected');
+    }
   }
 
   Future<void> _loadSavedHosts() async {
@@ -716,6 +835,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
     try {
       await _disconnect();
+      _framePresenter.clear();
 
       final client = RemoteClient(
         host: host,
@@ -745,30 +865,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           final now = DateTime.now();
           _lastFrameAt = now;
           _markSessionActivity('frame received', at: now);
-
-          final lastUi = _lastUiFrameAt;
-          final targetFps = _settings.fps <= 0 ? 15 : _settings.fps;
-          final minFrameIntervalMs = (1000 / targetFps).round().clamp(16, 100);
-          if (lastUi != null && now.difference(lastUi) < Duration(milliseconds: minFrameIntervalMs)) {
-            return;
-          }
-          _lastUiFrameAt = now;
-
-          setState(() {
-            final firstConnectedFrame = !_connected;
-            _frame = frame;
-            _connected = true;
-            _message = _useRelayMode
-                ? 'Connected via relay to $relayHostId'
-                : 'Connected to $host:$port';
-            _connectionStage = ConnectionStage.connected;
-            _reconnectAttempt = 0;
-            if (firstConnectedFrame) {
-              _recordLog(
-                _useRelayMode ? 'Connected via relay to $relayHostId' : 'Connected to $host:$port',
-              );
-            }
-          });
+          _framePresenter.submit(frame);
         },
         onError: (err) async {
           if (!mounted) {
@@ -778,9 +875,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             _message = 'Stream error: $err';
             _lastError = err.toString();
             _connected = false;
+            _hasRenderedFrame = false;
             _connectionStage = _mapErrorToConnectionStage(err);
             _recordLog('Stream error: $err');
           });
+          _framePresenter.clear();
           await _disconnect();
           _queueReconnectIfAllowed('stream error');
         },
@@ -793,10 +892,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 ? 'Disconnected.'
                 : 'Stream ended. Tap Connect to retry.';
             _connected = false;
+            _hasRenderedFrame = false;
             _connectionStage =
                 _manualDisconnectRequested ? ConnectionStage.stopped : ConnectionStage.disconnected;
             _recordLog(_manualDisconnectRequested ? 'Disconnected by user' : 'Stream ended');
           });
+          _framePresenter.clear();
           await _disconnect();
           _queueReconnectIfAllowed('stream ended');
         },
@@ -816,9 +917,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _message = 'Connect failed: $e';
         _lastError = e.toString();
         _connected = false;
+        _hasRenderedFrame = false;
         _connectionStage = _mapErrorToConnectionStage(e);
         _recordLog('Connect failed: $e');
       });
+      _framePresenter.clear();
       _queueReconnectIfAllowed('connect failure');
     } finally {
       if (mounted) {
@@ -843,10 +946,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _controlSubscription = null;
     await _remoteClient?.close();
     _remoteClient = null;
+    _framePresenter.clear();
 
     if (mounted) {
       setState(() {
         _connected = false;
+        _hasRenderedFrame = false;
         if (!_connecting && !_reconnecting) {
           _connectionStage = manual ? ConnectionStage.stopped : ConnectionStage.disconnected;
         }
@@ -1683,7 +1788,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
     final frameHeight = (media.size.height * 0.4).clamp(180.0, 420.0).toDouble();
-    final landscapeFullscreen = media.orientation == Orientation.landscape && _frame != null;
+    final landscapeFullscreen = media.orientation == Orientation.landscape && _hasRenderedFrame;
 
     if (landscapeFullscreen) {
       return Scaffold(
@@ -1914,7 +2019,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                       : Colors.green.shade700,
                 ),
               ),
-            if (_frame != null)
+            if (_hasRenderedFrame)
               Padding(
                 padding: const EdgeInsets.only(top: 12),
                 child: SizedBox(
@@ -1951,13 +2056,22 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             ),
             child: ClipRRect(
               borderRadius: borderRadius,
-              child: Image.memory(
-                _frame!,
-                width: double.infinity,
-                height: double.infinity,
-                fit: fit,
-                gaplessPlayback: true,
-                filterQuality: FilterQuality.none,
+              child: RepaintBoundary(
+                child: ValueListenableBuilder<ui.Image?>(
+                  valueListenable: _framePresenter.imageListenable,
+                  builder: (context, image, _) {
+                    if (image == null) {
+                      return const SizedBox.expand();
+                    }
+                    return RawImage(
+                      image: image,
+                      width: double.infinity,
+                      height: double.infinity,
+                      fit: fit,
+                      filterQuality: FilterQuality.none,
+                    );
+                  },
+                ),
               ),
             ),
           ),
@@ -1981,9 +2095,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       children: [
         Icon(Icons.lan, color: color),
         const SizedBox(width: 8),
-        Text(
-          text,
-          style: TextStyle(fontWeight: FontWeight.bold, color: color),
+        Expanded(
+          child: Text(
+            _hasRenderedFrame ? '$text, frame age ${_lastRenderedFrameAgeMs}ms' : text,
+            style: TextStyle(fontWeight: FontWeight.bold, color: color),
+          ),
         ),
       ],
     );
@@ -2173,9 +2289,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               initialValue: _settings.resolution,
               decoration: const InputDecoration(labelText: 'Resolution Preset'),
               items: const [
-                DropdownMenuItem(value: ResolutionPreset.low, child: Text('Low (960)')),
-                DropdownMenuItem(value: ResolutionPreset.medium, child: Text('Medium (1280)')),
-                DropdownMenuItem(value: ResolutionPreset.high, child: Text('High (1920)')),
+                DropdownMenuItem(value: ResolutionPreset.low, child: Text('Responsive (854)')),
+                DropdownMenuItem(value: ResolutionPreset.medium, child: Text('Balanced (960)')),
+                DropdownMenuItem(value: ResolutionPreset.high, child: Text('Quality (1280)')),
               ],
               onChanged: (value) {
                 if (value != null) {
