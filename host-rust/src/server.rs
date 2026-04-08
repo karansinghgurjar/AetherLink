@@ -130,6 +130,14 @@ const DEFAULT_KEY_PATH: &str = "../certs/server.key";
 const MAX_FILE_SIZE_BYTES: usize = 100 * 1024 * 1024;
 #[cfg(windows)]
 const MAX_LOG_ENTRIES: usize = 200;
+#[cfg(windows)]
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const VIDEO_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(windows)]
 static SERVER_LOGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -221,6 +229,25 @@ struct StreamTelemetry {
     last_patch_count: usize,
     last_move_count: usize,
     last_changed_ratio: f32,
+    video_frames_replaced_before_send: u64,
+    audio_packets_sent: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct EncodedVideoFrame {
+    msg_type: u8,
+    payload: Vec<u8>,
+    frame_id: u32,
+    width: u32,
+    height: u32,
+    capture_timestamp_ms: u64,
+    capture_duration_ms: u128,
+    encode_duration_ms: u128,
+    frame_kind: &'static str,
+    move_count: usize,
+    patch_count: usize,
+    changed_ratio: f32,
 }
 
 #[cfg(windows)]
@@ -308,6 +335,9 @@ pub async fn run_server_until_with_auth(
             }
             accept_result = listener.accept() => {
                 let (tcp_stream, peer_addr) = accept_result.context("Failed to accept client")?;
+                if let Err(err) = tcp_stream.set_nodelay(true) {
+                    log_event(format!("Failed to enable TCP_NODELAY for {peer_addr}: {err}"));
+                }
                 if !peer_addr.ip().is_loopback() {
                     let now = Instant::now();
                     while let Some(oldest) = accept_times.front() {
@@ -1200,8 +1230,13 @@ pub async fn run_session_over_stream<S>(
         };
 
         while let Ok(payload) = control_rx.try_recv() {
-            if let Err(err) =
-                protocol::write_message(&mut write_half, protocol::MSG_CONTROL_INPUT, &payload).await
+            if let Err(err) = write_message_with_timeout(
+                &mut write_half,
+                protocol::MSG_CONTROL_INPUT,
+                &payload,
+                CONTROL_WRITE_TIMEOUT,
+            )
+            .await
             {
                 log_event(format!(
                     "Client {peer_addr} disconnected while sending control event: {err}"
@@ -1250,10 +1285,11 @@ pub async fn run_session_over_stream<S>(
                         continue;
                     }
                     let payload = audio_capture::encode_audio_payload(&packet);
-                    if let Err(err) = protocol::write_message(
+                    if let Err(err) = write_message_with_timeout(
                         &mut write_half,
                         protocol::MSG_AUDIO_PACKET,
                         &payload,
+                        AUDIO_WRITE_TIMEOUT,
                     )
                     .await
                     {
@@ -1384,8 +1420,13 @@ pub async fn run_session_over_stream<S>(
             let encode_duration_ms = encode_started_at.elapsed().as_millis();
             let payload_len = payload.len();
             let send_started_at = Instant::now();
-            if let Err(err) =
-                protocol::write_message(&mut write_half, protocol::MSG_VIDEO_KEYFRAME, &payload).await
+            if let Err(err) = write_message_with_timeout(
+                &mut write_half,
+                protocol::MSG_VIDEO_KEYFRAME,
+                &payload,
+                VIDEO_WRITE_TIMEOUT,
+            )
+            .await
             {
                 log_event(format!(
                     "Client {peer_addr} disconnected while sending keyframe: {err}"
@@ -1440,8 +1481,13 @@ pub async fn run_session_over_stream<S>(
             let encode_duration_ms = encode_started_at.elapsed().as_millis();
             let payload_len = payload.len();
             let send_started_at = Instant::now();
-            if let Err(err) =
-                protocol::write_message(&mut write_half, protocol::MSG_VIDEO_DELTA, &payload).await
+            if let Err(err) = write_message_with_timeout(
+                &mut write_half,
+                protocol::MSG_VIDEO_DELTA,
+                &payload,
+                VIDEO_WRITE_TIMEOUT,
+            )
+            .await
             {
                 log_event(format!(
                     "Client {peer_addr} disconnected while sending delta frame: {err}"
@@ -1567,7 +1613,7 @@ pub async fn run_session_over_stream<S>(
             last_telemetry_sent_at = now;
         }
 
-        if let Err(err) = write_half.flush().await {
+        if let Err(err) = flush_with_timeout(&mut write_half, FLUSH_TIMEOUT).await {
             log_event(format!("Client {peer_addr} disconnected while flushing stream: {err}"));
             break;
         }
@@ -1632,6 +1678,40 @@ fn send_control_event(tx: &mpsc::UnboundedSender<Vec<u8>>, value: serde_json::Va
     tx.send(payload)
         .map_err(|_| anyhow!("control channel closed"))?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn write_message_with_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg_type: u8,
+    payload: &[u8],
+    timeout_duration: Duration,
+) -> std::io::Result<()> {
+    match timeout(timeout_duration, protocol::write_message(writer, msg_type, payload)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "write timed out after {}ms for message type {}",
+                timeout_duration.as_millis(),
+                msg_type
+            ),
+        )),
+    }
+}
+
+#[cfg(windows)]
+async fn flush_with_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    timeout_duration: Duration,
+) -> std::io::Result<()> {
+    match timeout(timeout_duration, writer.flush()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("flush timed out after {}ms", timeout_duration.as_millis()),
+        )),
+    }
 }
 
 #[cfg(windows)]
