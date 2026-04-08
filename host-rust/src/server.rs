@@ -505,6 +505,8 @@ pub async fn run_session_over_stream<S>(
     let input_control_tx = control_tx.clone();
     let resync_requests = Arc::new(AtomicU64::new(0));
     let input_resync_requests = resync_requests.clone();
+    let video_slot = Arc::new(Mutex::new(None::<EncodedVideoFrame>));
+    let video_slot_replacements = Arc::new(AtomicU64::new(0));
     let pending_pair_device = Arc::new(Mutex::new(None::<String>));
     let input_pending_pair_device = pending_pair_device.clone();
     let auth_nonce_b64 = random_b64(32);
@@ -1193,14 +1195,12 @@ pub async fn run_session_over_stream<S>(
             }
         }
     });
-
-    let mut last_rgba = Vec::new();
-    let mut last_width = 0u32;
-    let mut last_height = 0u32;
-    let mut last_frame_id = 0u32;
-    let mut next_frame_id = 1u32;
-    let mut frames_since_keyframe = 0u32;
-    let mut idle_frame_multiplier: u64 = 1;
+    let mut video_stop_rx = stop_rx.clone();
+    let mut video_panic_rx = panic_rx.clone();
+    let video_config = shared_config.clone();
+    let video_force_keyframe = force_keyframe.clone();
+    let video_slot_writer = video_slot.clone();
+    let video_slot_replacements_writer = video_slot_replacements.clone();
     let mut telemetry = StreamTelemetry::default();
     let mut last_telemetry_sent_at = Instant::now();
     let mut audio_packets_sent: u64 = 0;
@@ -1210,6 +1210,239 @@ pub async fn run_session_over_stream<S>(
     let audio_only_mode = std::env::var("AETHERLINK_AUDIO_ONLY_MODE")
         .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    let video_task = tokio::spawn(async move {
+        let mut last_rgba = Vec::new();
+        let mut last_width = 0u32;
+        let mut last_height = 0u32;
+        let mut last_frame_id = 0u32;
+        let mut next_frame_id = 1u32;
+        let mut frames_since_keyframe = 0u32;
+        loop {
+            if *video_stop_rx.borrow() {
+                break;
+            }
+
+            if *video_panic_rx.borrow() != panic_generation {
+                break;
+            }
+
+            if audio_only_mode {
+                select! {
+                    _ = sleep(Duration::from_millis(20)) => {}
+                    changed = video_stop_rx.changed() => {
+                        if changed.is_ok() && *video_stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    changed = video_panic_rx.changed() => {
+                        if changed.is_ok() && *video_panic_rx.borrow() != panic_generation {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let config_snapshot = match video_config.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_) => break,
+            };
+
+            let capture_started_at = Instant::now();
+            let capture_timestamp_ms = now_epoch_millis();
+            let capture_result = tokio::task::spawn_blocking({
+                let config_snapshot = config_snapshot.clone();
+                move || screen_capture::capture_desktop_rgba_with_config(&config_snapshot)
+            })
+            .await;
+            let (width, height, rgba) = match capture_result {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(err)) => {
+                    log_event(format!("Capture failed: {err}"));
+                    break;
+                }
+                Err(err) => {
+                    log_event(format!("Capture task failed: {err}"));
+                    break;
+                }
+            };
+            let capture_duration_ms = capture_started_at.elapsed().as_millis();
+
+            let force_keyframe_now = video_force_keyframe.swap(false, Ordering::SeqCst);
+            let maybe_plan = if !force_keyframe_now
+                && config_snapshot.delta_stream_enabled
+                && width == last_width
+                && height == last_height
+                && !last_rgba.is_empty()
+            {
+                delta_stream::detect_delta_plan(&last_rgba, &rgba, width, height)
+            } else {
+                None
+            };
+
+            let need_keyframe = force_keyframe_now
+                || force_keyframes_only
+                || !config_snapshot.delta_stream_enabled
+                || width != last_width
+                || height != last_height
+                || last_rgba.is_empty()
+                || frames_since_keyframe >= 60
+                || maybe_plan
+                    .as_ref()
+                    .map(|plan| {
+                        delta_stream::changed_ratio(plan, width, height) > 0.45
+                            || plan.patches.len() > 24
+                            || plan.moves.len() > 48
+                    })
+                    .unwrap_or(false);
+
+            let encoded_frame = if need_keyframe {
+                let encode_started_at = Instant::now();
+                let payload = match delta_stream::encode_keyframe_payload(
+                    next_frame_id,
+                    capture_timestamp_ms,
+                    width,
+                    height,
+                    &rgba,
+                    config_snapshot.jpeg_quality,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        log_event(format!("Keyframe encode failed: {err}"));
+                        break;
+                    }
+                };
+                let frame = EncodedVideoFrame {
+                    msg_type: protocol::MSG_VIDEO_KEYFRAME,
+                    payload,
+                    frame_id: next_frame_id,
+                    width,
+                    height,
+                    capture_timestamp_ms,
+                    capture_duration_ms,
+                    encode_duration_ms: encode_started_at.elapsed().as_millis(),
+                    frame_kind: "keyframe",
+                    move_count: 0,
+                    patch_count: 0,
+                    changed_ratio: 1.0,
+                };
+                last_frame_id = next_frame_id;
+                next_frame_id = next_frame_id.wrapping_add(1).max(1);
+                frames_since_keyframe = 0;
+                last_width = width;
+                last_height = height;
+                last_rgba = rgba;
+                frame
+            } else if let Some(plan) = maybe_plan {
+                let changed_ratio = delta_stream::changed_ratio(&plan, width, height);
+                let move_count = plan.moves.len();
+                let patch_count = plan.patches.len();
+                let encode_started_at = Instant::now();
+                let payload = match delta_stream::encode_delta_payload(
+                    next_frame_id,
+                    last_frame_id,
+                    capture_timestamp_ms,
+                    width,
+                    height,
+                    &rgba,
+                    &plan,
+                    config_snapshot.jpeg_quality,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        log_event(format!("Delta encode failed: {err}"));
+                        break;
+                    }
+                };
+                let frame = EncodedVideoFrame {
+                    msg_type: protocol::MSG_VIDEO_DELTA,
+                    payload,
+                    frame_id: next_frame_id,
+                    width,
+                    height,
+                    capture_timestamp_ms,
+                    capture_duration_ms,
+                    encode_duration_ms: encode_started_at.elapsed().as_millis(),
+                    frame_kind: "delta",
+                    move_count,
+                    patch_count,
+                    changed_ratio,
+                };
+                last_frame_id = next_frame_id;
+                next_frame_id = next_frame_id.wrapping_add(1).max(1);
+                frames_since_keyframe += 1;
+                last_width = width;
+                last_height = height;
+                last_rgba = rgba;
+                frame
+            } else {
+                select! {
+                    _ = sleep(Duration::from_millis(config_snapshot.frame_interval_ms())) => {}
+                    changed = video_stop_rx.changed() => {
+                        if changed.is_ok() && *video_stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    changed = video_panic_rx.changed() => {
+                        if changed.is_ok() && *video_panic_rx.borrow() != panic_generation {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            };
+
+            let mut replacement_log: Option<(u32, u32, u64)> = None;
+            let mut dropped_log: Option<(u32, u32)> = None;
+            if let Ok(mut slot) = video_slot_writer.lock() {
+                if let Some(previous) = slot.as_ref() {
+                    let previous_is_keyframe = previous.msg_type == protocol::MSG_VIDEO_KEYFRAME;
+                    let incoming_is_keyframe = encoded_frame.msg_type == protocol::MSG_VIDEO_KEYFRAME;
+                    if previous_is_keyframe && !incoming_is_keyframe {
+                        dropped_log = Some((previous.frame_id, encoded_frame.frame_id));
+                    } else {
+                        let previous = slot.replace(encoded_frame.clone()).expect("slot populated");
+                        let total = video_slot_replacements_writer.fetch_add(1, Ordering::SeqCst) + 1;
+                        replacement_log = Some((previous.frame_id, encoded_frame.frame_id, total));
+                    }
+                } else {
+                    *slot = Some(encoded_frame.clone());
+                }
+            } else {
+                break;
+            }
+            if let Some((old_frame_id, new_frame_id, total)) = replacement_log {
+                if new_frame_id % 30 == 0 {
+                    log_event(format!(
+                        "Frame replaced before send old_frame_id={} new_frame_id={} total_replaced={}",
+                        old_frame_id, new_frame_id, total
+                    ));
+                }
+            }
+            if let Some((old_frame_id, new_frame_id)) = dropped_log {
+                if new_frame_id % 30 == 0 {
+                    log_event(format!(
+                        "Frame dropped before send pending_keyframe={} dropped_delta={}",
+                        old_frame_id, new_frame_id
+                    ));
+                }
+            }
+
+            select! {
+                _ = sleep(Duration::from_millis(config_snapshot.frame_interval_ms())) => {}
+                changed = video_stop_rx.changed() => {
+                    if changed.is_ok() && *video_stop_rx.borrow() {
+                        break;
+                    }
+                }
+                changed = video_panic_rx.changed() => {
+                    if changed.is_ok() && *video_panic_rx.borrow() != panic_generation {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
     'write_loop: loop {
         if *write_stop_rx.borrow() {
@@ -1333,7 +1566,7 @@ pub async fn run_session_over_stream<S>(
         }
 
         if audio_only_mode {
-            if let Err(err) = write_half.flush().await {
+            if let Err(err) = flush_with_timeout(&mut write_half, FLUSH_TIMEOUT).await {
                 log_event(format!("Client {peer_addr} disconnected while flushing stream: {err}"));
                 break;
             }
@@ -1353,177 +1586,56 @@ pub async fn run_session_over_stream<S>(
             }
             continue;
         }
-
-        let capture_started_at = Instant::now();
-        let capture_timestamp_ms = now_epoch_millis();
-        let (width, height, rgba) =
-            match screen_capture::capture_desktop_rgba_with_config(&config_snapshot) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    log_event(format!("Capture failed: {err}"));
-                    break;
-                }
-            };
-        let capture_duration_ms = capture_started_at.elapsed().as_millis();
-
-        let force_keyframe_now = force_keyframe.swap(false, Ordering::SeqCst);
-        let maybe_plan = if !force_keyframe_now
-            && config_snapshot.delta_stream_enabled
-            && width == last_width
-            && height == last_height
-            && !last_rgba.is_empty()
-        {
-            delta_stream::detect_delta_plan(&last_rgba, &rgba, width, height)
-        } else {
-            None
+        let next_video_frame = match video_slot.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
         };
-
-        let need_keyframe = force_keyframe_now
-            || force_keyframes_only
-            || !config_snapshot.delta_stream_enabled
-            || width != last_width
-            || height != last_height
-            || last_rgba.is_empty()
-            || frames_since_keyframe >= 60
-            || maybe_plan
-                .as_ref()
-                .map(|plan| {
-                    delta_stream::changed_ratio(plan, width, height) > 0.45
-                        || plan.patches.len() > 24
-                        || plan.moves.len() > 48
-                })
-                .unwrap_or(false);
-
-        let frame_changed = need_keyframe || maybe_plan.is_some();
-        if frame_changed {
-            idle_frame_multiplier = 1;
-        } else {
-            idle_frame_multiplier = (idle_frame_multiplier + 1).min(4);
-        }
-
-        if need_keyframe {
-            let encode_started_at = Instant::now();
-            let payload = match delta_stream::encode_keyframe_payload(
-                next_frame_id,
-                capture_timestamp_ms,
-                width,
-                height,
-                &rgba,
-                config_snapshot.jpeg_quality,
-            ) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    log_event(format!("Keyframe encode failed: {err}"));
-                    break;
-                }
-            };
-            let encode_duration_ms = encode_started_at.elapsed().as_millis();
-            let payload_len = payload.len();
+        if let Some(frame) = next_video_frame {
+            let payload_len = frame.payload.len();
             let send_started_at = Instant::now();
             if let Err(err) = write_message_with_timeout(
                 &mut write_half,
-                protocol::MSG_VIDEO_KEYFRAME,
-                &payload,
+                frame.msg_type,
+                &frame.payload,
                 VIDEO_WRITE_TIMEOUT,
             )
             .await
             {
                 log_event(format!(
-                    "Client {peer_addr} disconnected while sending keyframe: {err}"
+                    "Client {peer_addr} disconnected while sending {} frame {}: {err}",
+                    frame.frame_kind, frame.frame_id
                 ));
                 break;
             }
             let send_duration_ms = send_started_at.elapsed().as_millis();
-            if next_frame_id % 30 == 0 {
+            if frame.frame_id % 30 == 0 {
                 log_event(format!(
-                    "Frame sample host frame_id={} type=keyframe capture_ts_ms={} capture_ms={} encode_ms={} send_ms={} bytes={} width={} height={}",
-                    next_frame_id,
-                    capture_timestamp_ms,
-                    capture_duration_ms,
-                    encode_duration_ms,
+                    "Frame sample host frame_id={} type={} capture_ts_ms={} capture_ms={} encode_ms={} send_ms={} bytes={} width={} height={} moves={} patches={} changed_ratio={:.3}",
+                    frame.frame_id,
+                    frame.frame_kind,
+                    frame.capture_timestamp_ms,
+                    frame.capture_duration_ms,
+                    frame.encode_duration_ms,
                     send_duration_ms,
                     payload_len,
-                    width,
-                    height
+                    frame.width,
+                    frame.height,
+                    frame.move_count,
+                    frame.patch_count,
+                    frame.changed_ratio
                 ));
             }
-            telemetry.keyframes_sent += 1;
-            telemetry.last_patch_count = 0;
-            telemetry.last_move_count = 0;
-            telemetry.last_changed_ratio = 1.0;
-            last_frame_id = next_frame_id;
-            next_frame_id = next_frame_id.wrapping_add(1).max(1);
-            frames_since_keyframe = 0;
-            last_width = width;
-            last_height = height;
-            last_rgba = rgba;
-        } else if let Some(plan) = maybe_plan {
-            let changed_ratio = delta_stream::changed_ratio(&plan, width, height);
-            let move_count = plan.moves.len();
-            let patch_count = plan.patches.len();
-            let encode_started_at = Instant::now();
-            let payload = match delta_stream::encode_delta_payload(
-                next_frame_id,
-                last_frame_id,
-                capture_timestamp_ms,
-                width,
-                height,
-                &rgba,
-                &plan,
-                config_snapshot.jpeg_quality,
-            ) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    log_event(format!("Delta encode failed: {err}"));
-                    break;
+            if frame.msg_type == protocol::MSG_VIDEO_KEYFRAME {
+                telemetry.keyframes_sent += 1;
+            } else {
+                telemetry.delta_frames_sent += 1;
+                if frame.move_count > 0 {
+                    telemetry.inferred_move_frames += 1;
                 }
-            };
-            let encode_duration_ms = encode_started_at.elapsed().as_millis();
-            let payload_len = payload.len();
-            let send_started_at = Instant::now();
-            if let Err(err) = write_message_with_timeout(
-                &mut write_half,
-                protocol::MSG_VIDEO_DELTA,
-                &payload,
-                VIDEO_WRITE_TIMEOUT,
-            )
-            .await
-            {
-                log_event(format!(
-                    "Client {peer_addr} disconnected while sending delta frame: {err}"
-                ));
-                break;
             }
-            let send_duration_ms = send_started_at.elapsed().as_millis();
-            if next_frame_id % 30 == 0 {
-                log_event(format!(
-                    "Frame sample host frame_id={} type=delta capture_ts_ms={} capture_ms={} encode_ms={} send_ms={} bytes={} width={} height={} moves={} patches={} changed_ratio={:.3}",
-                    next_frame_id,
-                    capture_timestamp_ms,
-                    capture_duration_ms,
-                    encode_duration_ms,
-                    send_duration_ms,
-                    payload_len,
-                    width,
-                    height,
-                    move_count,
-                    patch_count,
-                    changed_ratio
-                ));
-            }
-            telemetry.delta_frames_sent += 1;
-            telemetry.last_patch_count = patch_count;
-            telemetry.last_move_count = move_count;
-            telemetry.last_changed_ratio = changed_ratio;
-            if move_count > 0 {
-                telemetry.inferred_move_frames += 1;
-            }
-            last_frame_id = next_frame_id;
-            next_frame_id = next_frame_id.wrapping_add(1).max(1);
-            frames_since_keyframe += 1;
-            last_width = width;
-            last_height = height;
-            last_rgba = rgba;
+            telemetry.last_patch_count = frame.patch_count;
+            telemetry.last_move_count = frame.move_count;
+            telemetry.last_changed_ratio = frame.changed_ratio;
         }
 
         while clipboard_event_rx.try_recv().is_ok() {
@@ -1609,6 +1721,9 @@ pub async fn run_session_over_stream<S>(
         let now = Instant::now();
         if now.duration_since(last_telemetry_sent_at) >= StdDuration::from_secs(2) {
             telemetry.resync_requests = resync_requests.load(Ordering::SeqCst);
+            telemetry.video_frames_replaced_before_send =
+                video_slot_replacements.load(Ordering::SeqCst);
+            telemetry.audio_packets_sent = audio_packets_sent;
             let _ = send_control_event(&control_tx, stream_stats_event(&telemetry));
             last_telemetry_sent_at = now;
         }
@@ -1618,16 +1733,8 @@ pub async fn run_session_over_stream<S>(
             break;
         }
 
-        let mut frame_interval = Duration::from_millis(
-            config_snapshot
-                .frame_interval_ms()
-                .saturating_mul(idle_frame_multiplier),
-        );
-        if config_snapshot.audio_enabled && frame_interval > Duration::from_millis(20) {
-            frame_interval = Duration::from_millis(20);
-        }
         select! {
-            _ = sleep(frame_interval) => {}
+            _ = sleep(Duration::from_millis(10)) => {}
             changed = write_stop_rx.changed() => {
                 if changed.is_ok() && *write_stop_rx.borrow() {
                     break;
@@ -1646,6 +1753,8 @@ pub async fn run_session_over_stream<S>(
         stop_flag.store(true, Ordering::SeqCst);
     }
     let _ = write_half.shutdown().await;
+    video_task.abort();
+    let _ = video_task.await;
     input_task.abort();
     let _ = input_task.await;
     log_event(format!("Client session ended for {peer_addr}"));
@@ -2016,5 +2125,7 @@ fn stream_stats_event(telemetry: &StreamTelemetry) -> serde_json::Value {
         "last_patch_count": telemetry.last_patch_count,
         "last_move_count": telemetry.last_move_count,
         "last_changed_ratio": telemetry.last_changed_ratio,
+        "video_frames_replaced_before_send": telemetry.video_frames_replaced_before_send,
+        "audio_packets_sent": telemetry.audio_packets_sent,
     })
 }
