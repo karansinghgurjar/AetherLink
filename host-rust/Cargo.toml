@@ -1,0 +1,32 @@
+[package]
+name = "host-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = { version = "0.33", default-features = true }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+base64 = "0.22"
+arboard = "3.6"
+sha2 = "0.10"
+wasapi = "0.22"
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+anyhow = "1.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+] }

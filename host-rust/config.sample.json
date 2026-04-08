@@ -1,0 +1,12 @@
+{
+  "port": 6000,
+  "auth_token": null,
+  "cert_path": "../certs/server.crt",
+  "key_path": "../certs/server.key",
+  "default_monitor_index": 0,
+  "default_fps": 20,
+  "default_jpeg_quality": 70,
+  "default_target_width": 1280,
+  "download_dir": null,
+  "panic_hotkey_enabled": true
+}

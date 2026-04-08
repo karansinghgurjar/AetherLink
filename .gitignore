@@ -1,0 +1,44 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+
+# Runtime logs / crash dumps
+*.log
+*.hprof
+hs_err_pid*.log
+replay_pid*.log
+runtime-logs/
+
+# Local configuration
+config.json
+host-rust/config.json
+
+# Local certificates / secrets
+certs/
+*.key
+*.pem
+
+# Runtime output
+received_files/
+host-rust/received_files/
+host-rust/frame.jpg
+recv_frame.jpg
+
+# Rust build output
+target/
+host-rust/target/
+host-rust/target_*/
+relay-rust/target/
+
+# Flutter / Dart build output
+remote_client/.dart_tool/
+remote_client/.flutter-plugins-dependencies
+remote_client/build/
+remote_client/.idea/
+
+# Platform-specific generated artifacts
+remote_client/android/app/debug/
+remote_client/android/app/profile/
+remote_client/android/app/release/
