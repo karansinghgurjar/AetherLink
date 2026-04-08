@@ -100,9 +100,9 @@ impl Default for HostConfig {
             relay_host_id: "default-host".to_string(),
             relay_token: None,
             default_monitor_index: 0,
-            default_fps: 15,
-            default_jpeg_quality: 60,
-            default_target_width: Some(960),
+            default_fps: 12,
+            default_jpeg_quality: 50,
+            default_target_width: Some(720),
             download_dir: None,
             panic_hotkey_enabled: true,
         }
