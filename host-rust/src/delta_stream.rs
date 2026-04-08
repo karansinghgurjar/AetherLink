@@ -154,14 +154,16 @@ pub fn changed_ratio(plan: &DeltaPlan, width: u32, height: u32) -> f32 {
 #[cfg(windows)]
 pub fn encode_keyframe_payload(
     frame_id: u32,
+    capture_timestamp_ms: u64,
     width: u32,
     height: u32,
     rgba: &[u8],
     jpeg_quality: u8,
 ) -> Result<Vec<u8>> {
     let jpeg = encode_jpeg_rgba(width, height, rgba, jpeg_quality)?;
-    let mut payload = Vec::with_capacity(17 + jpeg.len());
+    let mut payload = Vec::with_capacity(25 + jpeg.len());
     payload.extend_from_slice(&frame_id.to_be_bytes());
+    payload.extend_from_slice(&capture_timestamp_ms.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
     payload.extend_from_slice(&height.to_be_bytes());
     payload.push(1);
@@ -174,6 +176,7 @@ pub fn encode_keyframe_payload(
 pub fn encode_delta_payload(
     frame_id: u32,
     base_frame_id: u32,
+    capture_timestamp_ms: u64,
     width: u32,
     height: u32,
     rgba: &[u8],
@@ -188,9 +191,10 @@ pub fn encode_delta_payload(
         patches.push((*rect, patch));
     }
 
-    let mut payload = Vec::with_capacity(20 + plan.moves.len() * 24 + plan.patches.len() * 21 + total_patch_bytes);
+    let mut payload = Vec::with_capacity(28 + plan.moves.len() * 24 + plan.patches.len() * 21 + total_patch_bytes);
     payload.extend_from_slice(&frame_id.to_be_bytes());
     payload.extend_from_slice(&base_frame_id.to_be_bytes());
+    payload.extend_from_slice(&capture_timestamp_ms.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&(plan.moves.len() as u16).to_be_bytes());
