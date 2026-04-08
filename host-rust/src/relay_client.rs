@@ -87,14 +87,22 @@ pub async fn run_host_via_relay(
     relay_token: Option<String>,
     required_token: Option<String>,
 ) -> Result<()> {
+    let mut reconnect_attempt: u64 = 0;
     loop {
-        eprintln!("Relay connect start for host_id={} via {}", host_id, relay_addr);
+        reconnect_attempt = reconnect_attempt.saturating_add(1);
+        eprintln!(
+            "Relay connect attempt={} start for host_id={} via {}",
+            reconnect_attempt, host_id, relay_addr
+        );
         let stop_rx = watch::channel(false).1;
         let panic_rx = watch::channel(0u64).1;
 
         let loop_result: Result<()> = async {
             let stream = connect_relay_tls(relay_addr).await?;
-            eprintln!("Relay connect success for host_id={} via {}", host_id, relay_addr);
+            eprintln!(
+                "Relay connect attempt={} success for host_id={} via {}",
+                reconnect_attempt, host_id, relay_addr
+            );
             let peer_addr = stream
                 .get_ref()
                 .0
@@ -108,13 +116,20 @@ pub async fn run_host_via_relay(
                 "host_id": host_id,
                 "token": relay_token,
             });
-            eprintln!("Relay register_host sent for host_id={}", host_id);
+            eprintln!(
+                "Relay register_host sent for host_id={} attempt={}",
+                host_id, reconnect_attempt
+            );
             send_control(&mut stream, registration).await?;
             let mut registration_confirmed = false;
 
             loop {
                 let read_future = protocol::read_message(&mut stream);
                 let message = if registration_confirmed {
+                    eprintln!(
+                        "Relay heartbeat/session wait active for host_id={} timeout_secs={}",
+                        host_id, RELAY_SESSION_WAIT_SECS
+                    );
                     timeout(Duration::from_secs(RELAY_SESSION_WAIT_SECS), read_future)
                         .await
                         .context("relay session wait timed out")??
@@ -135,15 +150,18 @@ pub async fn run_host_via_relay(
                     Some("relay_host_registered") => {
                         registration_confirmed = true;
                         eprintln!(
-                            "Relay host registration complete for host_id={} via {}",
-                            host_id, relay_addr
+                            "Relay host registration complete for host_id={} via {} attempt={}",
+                            host_id, relay_addr, reconnect_attempt
                         );
                     }
                     Some("relay_session_ready") => {
+                        let session_id = message
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         eprintln!(
-                            "Relay session ready for host_id={} session_id={}",
-                            host_id,
-                            message.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown")
+                            "Relay session ready for host_id={} session_id={} attempt={}",
+                            host_id, session_id, reconnect_attempt
                         );
                         server::run_session_over_stream(
                             stream,
@@ -153,7 +171,10 @@ pub async fn run_host_via_relay(
                             required_token.clone(),
                         )
                         .await;
-                        eprintln!("Relay session ended for host_id={}, re-registering", host_id);
+                        eprintln!(
+                            "Relay session ended for host_id={} session_id={} reason=server_session_returned re_registering=true",
+                            host_id, session_id
+                        );
                         return Ok(());
                     }
                     Some("relay_error") => {
@@ -161,6 +182,10 @@ pub async fn run_host_via_relay(
                             .get("message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown relay error");
+                        eprintln!(
+                            "Relay control error for host_id={} attempt={} detail={}",
+                            host_id, reconnect_attempt, detail
+                        );
                         return Err(anyhow!("relay rejected host registration: {detail}"));
                     }
                     other => {
@@ -173,12 +198,20 @@ pub async fn run_host_via_relay(
 
         match loop_result {
             Ok(()) => {
+                eprintln!(
+                    "Relay reconnect scheduled for host_id={} delay_secs={} reason=session_complete",
+                    host_id, RELAY_RECONNECT_DELAY_SECS
+                );
                 tokio::time::sleep(Duration::from_secs(RELAY_RECONNECT_DELAY_SECS)).await;
             }
             Err(err) => {
                 eprintln!(
-                    "Relay connection cycle failed for host_id={} via {}: {err}",
-                    host_id, relay_addr
+                    "Relay connection cycle failed for host_id={} via {} attempt={} disconnect_reason={err}",
+                    host_id, relay_addr, reconnect_attempt
+                );
+                eprintln!(
+                    "Relay reconnect scheduled for host_id={} delay_secs={} reason=connection_cycle_failed",
+                    host_id, RELAY_RECONNECT_DELAY_SECS
                 );
                 tokio::time::sleep(Duration::from_secs(RELAY_RECONNECT_DELAY_SECS)).await;
             }
