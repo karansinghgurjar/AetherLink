@@ -142,6 +142,7 @@ AetherLink is a secure remote desktop system with:
 - steady-state scheduling pass added:
   - host video capture/encode is now decoupled from transport writes via a latest-frame send slot
   - host replaces stale unsent video frames instead of preserving a growing send backlog
+  - host and client now preserve a pending keyframe baseline instead of allowing it to be displaced by a newer delta before delivery/decode
   - host write loop priority is now effectively control first, audio second, video last with the video slot remaining lossy
   - host stream telemetry now reports video frames replaced before send and audio packets sent
   - client audio queue is now bounded and drops stale/late packets instead of allowing deep lag buildup
@@ -150,6 +151,11 @@ AetherLink is a secure remote desktop system with:
 - monitor inventory/status sync
 - phone touch input works through relay
 - remote landscape fullscreen mode added on phone
+- client-side viewport controls added on phone:
+  - pinch zoom and manual zoom buttons
+  - pan while zoomed
+  - touch/mouse coordinate mapping now respects the zoomed viewport instead of the raw widget bounds
+  - visible client-side cursor overlay tracks the last remote pointer position sent from touch input
 
 ### Clipboard
 
