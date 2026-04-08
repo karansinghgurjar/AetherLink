@@ -67,6 +67,12 @@ enum TrustState {
   revoked,
 }
 
+enum StreamPhase {
+  connecting,
+  awaitingFirstFrame,
+  streaming,
+}
+
 class _SettingsState {
   ResolutionPreset resolution = ResolutionPreset.medium;
   int fps = 15;
@@ -179,21 +185,29 @@ class _LatestFramePresenter {
   _LatestFramePresenter({
     required this.onLog,
     required this.onPresented,
+    required this.isAwaitingFirstFrame,
   });
 
   static const int staleFrameThresholdMs = 200;
+  static const int startupStaleFrameThresholdMs = 5000;
 
   final void Function(String message) onLog;
   final void Function(RemoteVideoFrame frame, int renderedAgeMs) onPresented;
+  final bool Function() isAwaitingFirstFrame;
   final ValueNotifier<ui.Image?> imageListenable = ValueNotifier<ui.Image?>(null);
+  final ValueNotifier<Size?> frameSizeListenable = ValueNotifier<Size?>(null);
 
   RemoteVideoFrame? _pendingFrame;
   bool _rendering = false;
   int _replacedPendingCount = 0;
 
   void submit(RemoteVideoFrame frame) {
-    if (frame.ageMs > staleFrameThresholdMs) {
-      onLog('Render stale-frame drop: frame ${frame.frameId} age=${frame.ageMs}ms');
+    final awaitingFirstFrame = isAwaitingFirstFrame();
+    final staleThreshold = awaitingFirstFrame ? startupStaleFrameThresholdMs : staleFrameThresholdMs;
+    if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) && frame.queueAgeMs > staleThreshold) {
+      onLog(
+        'Render stale-frame drop: frame ${frame.frameId} queueAge=${frame.queueAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms threshold=${staleThreshold}ms phase=${awaitingFirstFrame ? 'awaiting_first_frame' : 'streaming'}',
+      );
       return;
     }
     if (_rendering) {
@@ -216,12 +230,14 @@ class _LatestFramePresenter {
     _rendering = false;
     final previous = imageListenable.value;
     imageListenable.value = null;
+    frameSizeListenable.value = null;
     previous?.dispose();
   }
 
   void dispose() {
     clear();
     imageListenable.dispose();
+    frameSizeListenable.dispose();
   }
 
   void _renderLatest(RemoteVideoFrame frame) {
@@ -233,20 +249,25 @@ class _LatestFramePresenter {
       frame.height,
       ui.PixelFormat.rgba8888,
       (ui.Image image) {
-        final renderedAgeMs = DateTime.now().millisecondsSinceEpoch - frame.captureTimestampMs;
-        if (renderedAgeMs > staleFrameThresholdMs) {
+        final awaitingFirstFrame = isAwaitingFirstFrame();
+        final staleThreshold = awaitingFirstFrame ? startupStaleFrameThresholdMs : staleFrameThresholdMs;
+        final renderedAgeMs = DateTime.now().millisecondsSinceEpoch - frame.receivedTimestampMs;
+        if ((!awaitingFirstFrame || !kDisableStartupStaleDrop) && renderedAgeMs > staleThreshold) {
           image.dispose();
-          onLog('Render stale-frame drop: frame ${frame.frameId} age=${renderedAgeMs}ms after decode');
+          onLog(
+            'Render stale-frame drop: frame ${frame.frameId} queueAge=${renderedAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms threshold=${staleThreshold}ms after decode',
+          );
           _rendering = false;
           _drainPending();
           return;
         }
         final previous = imageListenable.value;
         imageListenable.value = image;
+        frameSizeListenable.value = Size(frame.width.toDouble(), frame.height.toDouble());
         previous?.dispose();
         if (frame.frameId % 30 == 0) {
           onLog(
-            'Render submitted: frame ${frame.frameId} age=${renderedAgeMs}ms renderWait=${DateTime.now().millisecondsSinceEpoch - renderStartMs}ms',
+            'Render submitted: frame ${frame.frameId} queueAge=${renderedAgeMs}ms hostClockAge=${frame.hostClockAgeMs}ms renderWait=${DateTime.now().millisecondsSinceEpoch - renderStartMs}ms',
           );
         }
         onPresented(frame, renderedAgeMs);
@@ -279,6 +300,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   static const double _tapSlopSquared = 400;
   static const Duration _directHealthTimeout = Duration(seconds: 20);
   static const Duration _relayHealthTimeout = Duration(seconds: 120);
+  static const Duration _startupHealthTimeout = Duration(seconds: 15);
   static const Duration _healthPollInterval = Duration(seconds: 2);
   static const Duration _resyncCooldown = Duration(seconds: 15);
   static const String _savedHostsPrefsKey = 'saved_hosts_v1';
@@ -351,6 +373,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   DateTime? _lastFrameAt;
   bool _hasRenderedFrame = false;
   int _lastRenderedFrameAgeMs = 0;
+  String? _lastViewportSignature;
+  StreamPhase _streamPhase = StreamPhase.connecting;
+  DateTime? _connectStartedAt;
+  DateTime? _firstFrameReceivedAt;
+  bool _awaitingResyncKeyframe = false;
   DateTime? _lastSessionActivityAt;
   DateTime? _lastResyncRequestAt;
 
@@ -360,6 +387,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _framePresenter = _LatestFramePresenter(
       onLog: _recordLog,
       onPresented: _handlePresentedFrame,
+      isAwaitingFirstFrame: () => _streamPhase != StreamPhase.streaming,
     );
     unawaited(_loadSavedHosts());
     unawaited(_loadClientPrefs());
@@ -386,19 +414,31 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return;
     }
     final firstPresentedFrame = !_hasRenderedFrame;
+    final now = DateTime.now();
+    _markSessionActivity('frame rendered', at: now);
     _hasRenderedFrame = true;
     _connected = true;
     _connectionStage = ConnectionStage.connected;
     _reconnectAttempt = 0;
     _lastRenderedFrameAgeMs = renderedAgeMs;
+    _awaitingResyncKeyframe = false;
+    if (firstPresentedFrame) {
+      _streamPhase = StreamPhase.streaming;
+      final connectStartedAt = _connectStartedAt;
+      if (connectStartedAt != null) {
+        _recordLog(
+          'First frame rendered successfully: frame ${frame.frameId}, time_to_first_render_ms=${now.difference(connectStartedAt).inMilliseconds}, queue_age=${renderedAgeMs}ms',
+        );
+      } else {
+        _recordLog('First frame rendered successfully: frame ${frame.frameId}, queue_age=${renderedAgeMs}ms');
+      }
+      _recordLog('Session phase changed to streaming');
+    }
     _message = _useRelayMode
         ? 'Connected via relay to ${_relayHostIdController.text.trim()}'
         : 'Connected to ${_hostController.text.trim()}:${int.tryParse(_portController.text) ?? 0}';
     if (firstPresentedFrame || frame.frameId % 10 == 0) {
       setState(() {});
-    }
-    if (firstPresentedFrame) {
-      _recordLog(_message ?? 'Connected');
     }
   }
 
@@ -818,6 +858,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
     setState(() {
       _manualDisconnectRequested = false;
+      _streamPhase = StreamPhase.connecting;
+      _connectStartedAt = DateTime.now();
+      _firstFrameReceivedAt = null;
+      _awaitingResyncKeyframe = false;
       _connecting = true;
       _message = isReconnect
           ? 'Reconnecting to $host:$port...'
@@ -830,6 +874,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         '${isReconnect ? 'Reconnect' : 'Connect'} requested for $host:$port'
         '${_useRelayMode ? ' (relay host_id=$relayHostId)' : ''}',
       );
+      _recordLog('Session phase changed to connecting');
     });
     unawaited(_persistClientPrefs());
 
@@ -852,7 +897,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       await client.connect();
       setState(() {
         _connectionStage = ConnectionStage.authenticating;
+        _streamPhase = StreamPhase.awaitingFirstFrame;
       });
+      _recordLog('Session phase changed to awaiting_first_frame');
       await _applySettings(client);
       final controlSub = client.controlMessages.listen(_handleControlMessage);
 
@@ -865,6 +912,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           final now = DateTime.now();
           _lastFrameAt = now;
           _markSessionActivity('frame received', at: now);
+          _firstFrameReceivedAt ??= now;
+          if (_firstFrameReceivedAt == now) {
+            final connectStartedAt = _connectStartedAt;
+            _recordLog(
+              'First frame received: frame ${frame.frameId}, queue_age=${frame.queueAgeMs}ms, host_clock_age=${frame.hostClockAgeMs}ms${connectStartedAt == null ? '' : ', time_to_first_frame_ms=${now.difference(connectStartedAt).inMilliseconds}'}',
+            );
+          }
           _framePresenter.submit(frame);
         },
         onError: (err) async {
@@ -876,6 +930,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             _lastError = err.toString();
             _connected = false;
             _hasRenderedFrame = false;
+            _streamPhase = StreamPhase.connecting;
             _connectionStage = _mapErrorToConnectionStage(err);
             _recordLog('Stream error: $err');
           });
@@ -893,6 +948,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 : 'Stream ended. Tap Connect to retry.';
             _connected = false;
             _hasRenderedFrame = false;
+            _streamPhase = StreamPhase.connecting;
             _connectionStage =
                 _manualDisconnectRequested ? ConnectionStage.stopped : ConnectionStage.disconnected;
             _recordLog(_manualDisconnectRequested ? 'Disconnected by user' : 'Stream ended');
@@ -918,6 +974,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _lastError = e.toString();
         _connected = false;
         _hasRenderedFrame = false;
+        _streamPhase = StreamPhase.connecting;
         _connectionStage = _mapErrorToConnectionStage(e);
         _recordLog('Connect failed: $e');
       });
@@ -952,6 +1009,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _connected = false;
         _hasRenderedFrame = false;
+        _streamPhase = StreamPhase.connecting;
+        _awaitingResyncKeyframe = false;
         if (!_connecting && !_reconnecting) {
           _connectionStage = manual ? ConnectionStage.stopped : ConnectionStage.disconnected;
         }
@@ -973,34 +1032,54 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   void _startHealthChecks() {
     _healthTimer?.cancel();
-    final threshold = _useRelayMode ? _relayHealthTimeout : _directHealthTimeout;
     _recordLog(
-      'Health timer started (${_useRelayMode ? 'relay' : 'direct'}) threshold=${threshold.inSeconds}s',
+      'Health timer started (${_useRelayMode ? 'relay' : 'direct'}) startup_threshold=${_startupHealthTimeout.inSeconds}s steady_threshold=${(_useRelayMode ? _relayHealthTimeout : _directHealthTimeout).inSeconds}s',
     );
     _healthTimer = Timer.periodic(_healthPollInterval, (_) async {
       final lastActivityAt = _lastSessionActivityAt ?? _lastFrameAt;
-      if (!_connected || lastActivityAt == null) {
+      if (!_connected) {
         return;
       }
 
-      final idleFor = DateTime.now().difference(lastActivityAt);
+      final now = DateTime.now();
+      final threshold = _hasRenderedFrame
+          ? (_useRelayMode ? _relayHealthTimeout : _directHealthTimeout)
+          : _startupHealthTimeout;
+      final baselineAt = lastActivityAt ?? _connectStartedAt;
+      if (baselineAt == null) {
+        return;
+      }
+
+      final idleFor = now.difference(baselineAt);
       final stale = idleFor > threshold;
       if (!stale) {
+        return;
+      }
+
+      if (!_hasRenderedFrame) {
+        _recordLog(
+          'Startup health warning: no first frame yet after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s)',
+        );
+      }
+
+      if (_awaitingResyncKeyframe) {
+        _recordLog(
+          'Health timeout suppressed: already awaiting resync keyframe for ${idleFor.inSeconds}s',
+        );
         return;
       }
 
       final lastResyncRequestAt = _lastResyncRequestAt;
       final shouldRequestResync =
           lastResyncRequestAt == null ||
-          DateTime.now().difference(lastResyncRequestAt) > _resyncCooldown;
+          now.difference(lastResyncRequestAt) > _resyncCooldown;
 
       if (shouldRequestResync) {
-        _lastResyncRequestAt = DateTime.now();
         _recordLog(
-          'Health timeout fired after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s), requesting resync',
+          'Health timeout fired after ${idleFor.inSeconds}s (threshold=${threshold.inSeconds}s), requesting resync (phase=${_streamPhase.name})',
         );
         try {
-          await _remoteClient?.requestResync();
+          await _requestResyncWithGuard('health timeout after ${idleFor.inSeconds}s');
         } catch (err) {
           if (!mounted) {
             return;
@@ -1593,6 +1672,24 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return;
     }
 
+    if (type == 'client_video_packet') {
+      _markSessionActivity('video_packet');
+      return;
+    }
+
+    if (type == 'client_audio_packet') {
+      _markSessionActivity('audio_packet');
+      return;
+    }
+
+    if (type == 'client_resync_needed') {
+      final reason = message['reason'] as String? ?? 'unknown';
+      final frameId = message['frame_id'];
+      _recordLog('Decode requested resync: frame=$frameId reason=$reason');
+      unawaited(_requestResyncWithGuard('decode:$reason frame=$frameId'));
+      return;
+    }
+
     if (type == 'clipboard_data') {
       final text = message['text'] as String? ?? '';
       final syncId = message['sync_id'] as String?;
@@ -1782,6 +1879,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       next.removeRange(0, next.length - 80);
     }
     _clientLogs = next;
+  }
+
+  Future<void> _requestResyncWithGuard(String reason) async {
+    if (_awaitingResyncKeyframe) {
+      _recordLog('Resync suppressed while awaiting keyframe: $reason');
+      return;
+    }
+    _awaitingResyncKeyframe = true;
+    _lastResyncRequestAt = DateTime.now();
+    _recordLog('Resync requested: $reason');
+    await _remoteClient?.requestResync();
   }
 
   @override
@@ -2041,42 +2149,64 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     required BorderRadius borderRadius,
   }) {
     return LayoutBuilder(
-      builder: (context, imageConstraints) => Listener(
-        behavior: HitTestBehavior.opaque,
-        onPointerDown: (event) => _handlePointerDown(event.localPosition, imageConstraints),
-        onPointerMove: (event) => _handlePointerMove(event.localPosition, imageConstraints),
-        onPointerUp: (event) => _handlePointerUp(event.localPosition, imageConstraints),
-        child: GestureDetector(
+      builder: (context, imageConstraints) {
+        return Listener(
           behavior: HitTestBehavior.opaque,
-          onLongPressStart: (details) => _handleLongPressStart(details, imageConstraints),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.black26),
-              borderRadius: borderRadius,
-            ),
-            child: ClipRRect(
-              borderRadius: borderRadius,
-              child: RepaintBoundary(
-                child: ValueListenableBuilder<ui.Image?>(
-                  valueListenable: _framePresenter.imageListenable,
-                  builder: (context, image, _) {
-                    if (image == null) {
-                      return const SizedBox.expand();
-                    }
-                    return RawImage(
-                      image: image,
-                      width: double.infinity,
-                      height: double.infinity,
-                      fit: fit,
-                      filterQuality: FilterQuality.none,
-                    );
-                  },
+          onPointerDown: (event) => _handlePointerDown(event.localPosition, imageConstraints),
+          onPointerMove: (event) => _handlePointerMove(event.localPosition, imageConstraints),
+          onPointerUp: (event) => _handlePointerUp(event.localPosition, imageConstraints),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onLongPressStart: (details) => _handleLongPressStart(details, imageConstraints),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.black26),
+                borderRadius: borderRadius,
+              ),
+              child: ClipRRect(
+                borderRadius: borderRadius,
+                child: RepaintBoundary(
+                  child: ValueListenableBuilder<ui.Image?>(
+                    valueListenable: _framePresenter.imageListenable,
+                    builder: (context, image, _) {
+                      return ValueListenableBuilder<Size?>(
+                        valueListenable: _framePresenter.frameSizeListenable,
+                        builder: (context, frameSize, _) {
+                          if (image == null || frameSize == null || frameSize.width <= 0 || frameSize.height <= 0) {
+                            return const SizedBox.expand();
+                          }
+                          final viewportSignature =
+                              '${frameSize.width.toInt()}x${frameSize.height.toInt()}|${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)}|${MediaQuery.of(context).orientation.name}';
+                          if (_lastViewportSignature != viewportSignature) {
+                            _lastViewportSignature = viewportSignature;
+                            _recordLog(
+                              'Render viewport: frame=${frameSize.width.toInt()}x${frameSize.height.toInt()} constraints=${imageConstraints.maxWidth.toStringAsFixed(0)}x${imageConstraints.maxHeight.toStringAsFixed(0)} fit=contain orientation=${MediaQuery.of(context).orientation.name}',
+                            );
+                          }
+                          return Center(
+                            child: FittedBox(
+                              fit: BoxFit.contain,
+                              child: SizedBox(
+                                width: frameSize.width,
+                                height: frameSize.height,
+                                child: RawImage(
+                                  image: image,
+                                  fit: BoxFit.contain,
+                                  filterQuality: FilterQuality.none,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
