@@ -111,6 +111,18 @@ AetherLink is a secure remote desktop system with:
 - inferred move rects
 - resync request flow
 - stream telemetry
+- latest-frame-wins client stream pipeline implemented:
+  - one newest compressed frame pending before decode
+  - one newest frame pending before render submission
+  - stale frame replacement instead of FIFO playback
+- client decode/render path improved:
+  - heavy frame decode moved off the main isolate into a worker isolate
+  - render path switched away from per-frame PNG re-encode + `Image.memory`
+  - latest RGBA frame now renders through a dedicated presenter / `RawImage` path
+- frame freshness instrumentation added:
+  - host capture timestamp now travels with video frames
+  - sampled host capture / encode / send timing logs added
+  - sampled client receive / replace / decode / render timing logs added
 - monitor inventory/status sync
 - phone touch input works through relay
 - remote landscape fullscreen mode added on phone
@@ -268,6 +280,10 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
   - stutter/jitter tuning
   - cleaner mute/unmute behavior
   - optional remote-only audio mode if desired
+- verify the new latest-frame-wins stream path under real cross-network load:
+  - confirm latency reduction
+  - confirm stale-frame dropping is happening as intended
+  - confirm stream no longer behaves like still-image snapshots
 - better relay observability:
   - clearer logs
   - clearer UI state
@@ -288,6 +304,10 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 - polished cross-network public relay deployment flow
 - formal benchmark/evidence capture pack
 - release packaging/tagging
+- explicit user-selectable stream quality preset UX naming:
+  - Responsive
+  - Balanced
+  - Quality
 - optional host-side audio-output mode selection:
   - local only
   - remote only
