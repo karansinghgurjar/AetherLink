@@ -21,6 +21,7 @@ const int _msgAudioPacket = 0x05;
 const int _codecJpeg = 0x01;
 const int _audioCodecPcmS16Le = 0x00;
 const int _frameLogSampleEvery = 30;
+const int _maxPendingAudioPackets = 6;
 const bool kDebugAudioOnlyMode = bool.fromEnvironment('AETHERLINK_AUDIO_ONLY_MODE', defaultValue: false);
 const bool kDisableStartupStaleDrop =
     bool.fromEnvironment('AETHERLINK_DISABLE_STARTUP_STALE_DROP', defaultValue: false);
@@ -62,6 +63,22 @@ class _PendingCompressedFrame {
   final Uint8List payload;
   final int frameId;
   final int receivedTimestampMs;
+}
+
+class _PendingAudioPacket {
+  const _PendingAudioPacket({
+    required this.payload,
+    required this.receivedTimestampMs,
+    required this.ptsMs,
+    required this.sequence,
+  });
+
+  final Uint8List payload;
+  final int receivedTimestampMs;
+  final int ptsMs;
+  final int sequence;
+
+  int get queueAgeMs => DateTime.now().millisecondsSinceEpoch - receivedTimestampMs;
 }
 
 class TrustedDeviceIdentity {
@@ -182,10 +199,11 @@ class RemoteClient {
   bool _decodeLoopRunning = false;
   _PendingCompressedFrame? _pendingCompressedFrame;
   int _replacedCompressedFrameCount = 0;
-  final Queue<Uint8List> _pendingAudioPackets = Queue<Uint8List>();
+  final Queue<_PendingAudioPacket> _pendingAudioPackets = Queue<_PendingAudioPacket>();
   bool _audioDispatchRunning = false;
   int _audioPacketsReceived = 0;
   int _audioPacketsSubmitted = 0;
+  int _audioPacketsDropped = 0;
 
   RemoteClient({
     required this.host,
@@ -400,11 +418,25 @@ class RemoteClient {
     }
     final frameId = _peekFrameId(messageType, payload);
     final receivedTimestampMs = DateTime.now().millisecondsSinceEpoch;
-    if (_pendingCompressedFrame != null) {
+    final existing = _pendingCompressedFrame;
+    if (existing != null) {
+      final existingIsKeyframe = existing.messageType == _msgVideoKeyframe;
+      final incomingIsKeyframe = messageType == _msgVideoKeyframe;
+
+      // Never let a pending keyframe baseline get displaced by a newer delta.
+      if (existingIsKeyframe && !incomingIsKeyframe) {
+        if (frameId % _frameLogSampleEvery == 0) {
+          print(
+            'video frame dropped before decode old_frame=${existing.frameId} kept_reason=pending_keyframe new_frame=$frameId dropped_reason=awaiting_keyframe_decode',
+          );
+        }
+        return;
+      }
+
       _replacedCompressedFrameCount += 1;
       if (frameId % _frameLogSampleEvery == 0) {
         print(
-          'video frame replaced before decode old_frame=${_pendingCompressedFrame!.frameId} new_frame=$frameId dropped_reason=decode_backlog total_replaced=$_replacedCompressedFrameCount',
+          'video frame replaced before decode old_frame=${existing.frameId} new_frame=$frameId dropped_reason=decode_backlog total_replaced=$_replacedCompressedFrameCount',
         );
       }
     }
@@ -819,6 +851,8 @@ class RemoteClient {
     final sampleRate = data.getUint32(14, Endian.big);
     final codec = data.getUint8(18);
     final audioLen = data.getUint32(19, Endian.big);
+    final ptsMs = data.getUint64(0, Endian.big).toInt();
+    final sequence = data.getUint32(8, Endian.big);
     if (payload.length < 23 + audioLen) {
       return;
     }
@@ -831,9 +865,23 @@ class RemoteClient {
     }
     _audioPacketsReceived += 1;
     print(
-      '[audio] packet received count=$_audioPacketsReceived sampleRate=$sampleRate channels=$channels codec=$codec bytes=$audioLen',
+      '[audio] packet received count=$_audioPacketsReceived seq=$sequence pts=$ptsMs sampleRate=$sampleRate channels=$channels codec=$codec bytes=$audioLen',
     );
-    _pendingAudioPackets.addLast(Uint8List.fromList(payload));
+    if (_pendingAudioPackets.length >= _maxPendingAudioPackets) {
+      final dropped = _pendingAudioPackets.removeFirst();
+      _audioPacketsDropped += 1;
+      print(
+        '[audio] late-drop seq=${dropped.sequence} queueAge=${dropped.queueAgeMs}ms totalDropped=$_audioPacketsDropped',
+      );
+    }
+    _pendingAudioPackets.addLast(
+      _PendingAudioPacket(
+        payload: Uint8List.fromList(payload),
+        receivedTimestampMs: DateTime.now().millisecondsSinceEpoch,
+        ptsMs: ptsMs,
+        sequence: sequence,
+      ),
+    );
     if (!_audioDispatchRunning) {
       unawaited(_drainAudioQueue());
     }
@@ -846,12 +894,20 @@ class RemoteClient {
     _audioDispatchRunning = true;
     try {
       while (_pendingAudioPackets.isNotEmpty) {
-        final payload = _pendingAudioPackets.removeFirst();
+        final pending = _pendingAudioPackets.removeFirst();
+        final payload = pending.payload;
         final data = ByteData.sublistView(payload);
         final channels = data.getUint16(12, Endian.big);
         final sampleRate = data.getUint32(14, Endian.big);
         final audioLen = data.getUint32(19, Endian.big);
         final audioBytes = Uint8List.sublistView(payload, 23, 23 + audioLen);
+        if (pending.queueAgeMs > 250) {
+          _audioPacketsDropped += 1;
+          print(
+            '[audio] stale-drop seq=${pending.sequence} queueAge=${pending.queueAgeMs}ms totalDropped=$_audioPacketsDropped',
+          );
+          continue;
+        }
         try {
           await _audioSink.playPcm16(
             sampleRate: sampleRate,
@@ -861,7 +917,7 @@ class RemoteClient {
           _audioPacketsSubmitted += 1;
           if (_audioPacketsSubmitted % _frameLogSampleEvery == 0) {
             print(
-              '[audio] playback submitted count=$_audioPacketsSubmitted sampleRate=$sampleRate channels=$channels bytes=$audioLen queue=${_pendingAudioPackets.length}',
+              '[audio] playback submitted count=$_audioPacketsSubmitted seq=${pending.sequence} pts=${pending.ptsMs} sampleRate=$sampleRate channels=$channels bytes=$audioLen queue=${_pendingAudioPackets.length} dropped=$_audioPacketsDropped',
             );
           }
         } catch (err) {
