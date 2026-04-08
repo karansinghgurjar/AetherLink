@@ -1173,6 +1173,13 @@ pub async fn run_session_over_stream<S>(
     let mut idle_frame_multiplier: u64 = 1;
     let mut telemetry = StreamTelemetry::default();
     let mut last_telemetry_sent_at = Instant::now();
+    let mut audio_packets_sent: u64 = 0;
+    let force_keyframes_only = std::env::var("AETHERLINK_FORCE_KEYFRAMES_ONLY")
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let audio_only_mode = std::env::var("AETHERLINK_AUDIO_ONLY_MODE")
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     'write_loop: loop {
         if *write_stop_rx.borrow() {
@@ -1213,7 +1220,9 @@ pub async fn run_session_over_stream<S>(
                 audio_rx = Some(fresh_audio_rx);
                 audio_stop = Some(fresh_audio_stop);
                 audio_capture_running = true;
-                log_event(format!("Audio capture started for {peer_addr}"));
+                log_event(format!(
+                    "Audio capture started for {peer_addr} enabled=true audio_only_mode={audio_only_mode}"
+                ));
             }
         } else if audio_capture_running {
             if let Some(stop_flag) = audio_stop.take() {
@@ -1222,6 +1231,91 @@ pub async fn run_session_over_stream<S>(
             audio_rx = None;
             audio_capture_running = false;
             log_event(format!("Audio capture stopped for {peer_addr}"));
+        }
+
+        while let Some(receiver) = audio_rx.as_mut() {
+            let audio_message = match receiver.try_recv() {
+                Ok(message) => message,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    audio_rx = None;
+                    audio_capture_running = false;
+                    log_event(format!("Audio capture channel closed for {peer_addr}"));
+                    break;
+                }
+            };
+            match audio_message {
+                Ok(packet) => {
+                    if !config_snapshot.audio_enabled {
+                        continue;
+                    }
+                    let payload = audio_capture::encode_audio_payload(&packet);
+                    if let Err(err) = protocol::write_message(
+                        &mut write_half,
+                        protocol::MSG_AUDIO_PACKET,
+                        &payload,
+                    )
+                    .await
+                    {
+                        log_event(format!(
+                            "Client {peer_addr} disconnected while sending audio packet: {err}"
+                        ));
+                        break 'write_loop;
+                    }
+                    audio_packets_sent += 1;
+                    if audio_packets_sent % 60 == 0 {
+                        log_event(format!(
+                            "[audio] packets_sent={} last_seq={} last_pts_ms={} last_bytes={}",
+                            audio_packets_sent,
+                            packet.sequence,
+                            packet.pts_ms,
+                            payload.len()
+                        ));
+                    }
+                }
+                Err(err) => {
+                    if !config_snapshot.audio_enabled {
+                        continue;
+                    }
+                    audio_rx = None;
+                    if let Some(stop_flag) = audio_stop.take() {
+                        stop_flag.store(true, Ordering::SeqCst);
+                    }
+                    audio_capture_running = false;
+                    log_event(format!("Audio capture failed for {peer_addr}: {err}"));
+                    let _ = send_control_event(
+                        &control_tx,
+                        serde_json::json!({
+                            "type": "host_error",
+                            "source": "audio_capture",
+                            "message": err,
+                        }),
+                    );
+                    break;
+                }
+            }
+        }
+
+        if audio_only_mode {
+            if let Err(err) = write_half.flush().await {
+                log_event(format!("Client {peer_addr} disconnected while flushing stream: {err}"));
+                break;
+            }
+            select! {
+                _ = sleep(Duration::from_millis(10)) => {}
+                changed = write_stop_rx.changed() => {
+                    if changed.is_ok() && *write_stop_rx.borrow() {
+                        break;
+                    }
+                }
+                changed = panic_rx.changed() => {
+                    if changed.is_ok() && *panic_rx.borrow() != panic_generation {
+                        log_event(format!("[panic] session terminated by hotkey for {peer_addr}"));
+                        break;
+                    }
+                }
+            }
+            continue;
         }
 
         let capture_started_at = Instant::now();
@@ -1249,6 +1343,7 @@ pub async fn run_session_over_stream<S>(
         };
 
         let need_keyframe = force_keyframe_now
+            || force_keyframes_only
             || !config_snapshot.delta_stream_enabled
             || width != last_width
             || height != last_height
@@ -1470,59 +1565,6 @@ pub async fn run_session_over_stream<S>(
             telemetry.resync_requests = resync_requests.load(Ordering::SeqCst);
             let _ = send_control_event(&control_tx, stream_stats_event(&telemetry));
             last_telemetry_sent_at = now;
-        }
-
-        while let Some(receiver) = audio_rx.as_mut() {
-            let audio_message = match receiver.try_recv() {
-                Ok(message) => message,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    audio_rx = None;
-                    audio_capture_running = false;
-                    log_event(format!("Audio capture channel closed for {peer_addr}"));
-                    break;
-                }
-            };
-            match audio_message {
-                Ok(packet) => {
-                    if !config_snapshot.audio_enabled {
-                        continue;
-                    }
-                    let payload = audio_capture::encode_audio_payload(&packet);
-                    if let Err(err) = protocol::write_message(
-                        &mut write_half,
-                        protocol::MSG_AUDIO_PACKET,
-                        &payload,
-                    )
-                    .await
-                    {
-                        log_event(format!(
-                            "Client {peer_addr} disconnected while sending audio packet: {err}"
-                        ));
-                        break 'write_loop;
-                    }
-                }
-                Err(err) => {
-                    if !config_snapshot.audio_enabled {
-                        continue;
-                    }
-                    audio_rx = None;
-                    if let Some(stop_flag) = audio_stop.take() {
-                        stop_flag.store(true, Ordering::SeqCst);
-                    }
-                    audio_capture_running = false;
-                    log_event(format!("Audio capture failed for {peer_addr}: {err}"));
-                    let _ = send_control_event(
-                        &control_tx,
-                        serde_json::json!({
-                            "type": "host_error",
-                            "source": "audio_capture",
-                            "message": err,
-                        }),
-                    );
-                    break;
-                }
-            }
         }
 
         if let Err(err) = write_half.flush().await {
