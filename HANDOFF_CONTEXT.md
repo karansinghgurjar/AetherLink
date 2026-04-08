@@ -119,10 +119,17 @@ AetherLink is a secure remote desktop system with:
   - heavy frame decode moved off the main isolate into a worker isolate
   - render path switched away from per-frame PNG re-encode + `Image.memory`
   - latest RGBA frame now renders through a dedicated presenter / `RawImage` path
+- render/audio regression fixes added after the low-latency refactor:
+  - `RawImage` path now presents the full frame with centered contain-fit behavior
+  - decoded RGBA length and dimension mismatch guards now drop + resync instead of presenting partial frames
+  - delta move/patch bounds are validated against the full frame before compositing
+  - audio packet handling no longer blocks the main receive loop; playback is queued separately
+  - reconnect lifecycle no longer closes the video stream permanently after one session
 - frame freshness instrumentation added:
   - host capture timestamp now travels with video frames
   - sampled host capture / encode / send timing logs added
   - sampled client receive / replace / decode / render timing logs added
+  - sampled protocol / audio receive / audio playback logs added
 - monitor inventory/status sync
 - phone touch input works through relay
 - remote landscape fullscreen mode added on phone
