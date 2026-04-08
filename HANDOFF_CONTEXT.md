@@ -139,6 +139,14 @@ AetherLink is a secure remote desktop system with:
   - client enables `TCP_NODELAY`
   - host enables `TCP_NODELAY` and now applies bounded write/flush timeouts so stalled sends fail fast instead of hanging silently
   - if a resync keyframe never arrives, the client now falls back to reconnect instead of waiting indefinitely
+- steady-state scheduling pass added:
+  - host video capture/encode is now decoupled from transport writes via a latest-frame send slot
+  - host replaces stale unsent video frames instead of preserving a growing send backlog
+  - host write loop priority is now effectively control first, audio second, video last with the video slot remaining lossy
+  - host stream telemetry now reports video frames replaced before send and audio packets sent
+  - client audio queue is now bounded and drops stale/late packets instead of allowing deep lag buildup
+  - client health decisions now log separate video/audio/render/control ages
+  - runtime defaults were reduced to a more responsive profile: `720px / 12 FPS / JPEG 50`
 - monitor inventory/status sync
 - phone touch input works through relay
 - remote landscape fullscreen mode added on phone
