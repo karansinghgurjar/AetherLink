@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -19,6 +20,45 @@ const int _msgVideoDelta = 0x04;
 const int _msgAudioPacket = 0x05;
 const int _codecJpeg = 0x01;
 const int _audioCodecPcmS16Le = 0x00;
+const int _frameLogSampleEvery = 30;
+
+class RemoteVideoFrame {
+  const RemoteVideoFrame({
+    required this.frameId,
+    required this.width,
+    required this.height,
+    required this.rgbaBytes,
+    required this.captureTimestampMs,
+    required this.receivedTimestampMs,
+    required this.messageType,
+  });
+
+  final int frameId;
+  final int width;
+  final int height;
+  final Uint8List rgbaBytes;
+  final int captureTimestampMs;
+  final int receivedTimestampMs;
+  final int messageType;
+
+  int get ageMs => DateTime.now().millisecondsSinceEpoch - captureTimestampMs;
+
+  bool get isKeyframe => messageType == _msgVideoKeyframe;
+}
+
+class _PendingCompressedFrame {
+  const _PendingCompressedFrame({
+    required this.messageType,
+    required this.payload,
+    required this.frameId,
+    required this.receivedTimestampMs,
+  });
+
+  final int messageType;
+  final Uint8List payload;
+  final int frameId;
+  final int receivedTimestampMs;
+}
 
 class TrustedDeviceIdentity {
   const TrustedDeviceIdentity({
@@ -109,6 +149,7 @@ class RemoteClient {
   SecureSocket? _socket;
   StreamIterator<Uint8List>? _iterator;
   final StreamController<Map<String, dynamic>> _controlMessages = StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<RemoteVideoFrame> _videoFrames = StreamController<RemoteVideoFrame>.broadcast();
   final ListQueue<String> _recentClipboardSyncIds = ListQueue<String>();
   String _clipboardMode = 'manual';
   String? _lastAppliedClipboardHash;
@@ -116,8 +157,6 @@ class RemoteClient {
   Uint8List _pending = Uint8List(0);
   int _pendingOffset = 0;
   bool _authenticated = false;
-  img.Image? _frameBuffer;
-  int _currentFrameId = 0;
   final _AndroidAudioSink _audioSink = _AndroidAudioSink();
   final AndroidTrustIdentityService _trustIdentityService = AndroidTrustIdentityService.instance;
   TrustedDeviceIdentity? _trustedIdentity;
@@ -127,6 +166,17 @@ class RemoteClient {
   final Map<String, Completer<void>> _pendingTransferStarts = <String, Completer<void>>{};
   final Map<String, Map<int, Completer<void>>> _pendingTransferChunkAcks =
       <String, Map<int, Completer<void>>>{};
+  Isolate? _frameDecodeIsolate;
+  ReceivePort? _frameDecodeReceivePort;
+  SendPort? _frameDecodeSendPort;
+  final Map<int, Completer<Map<String, Object?>>> _pendingDecodeResponses =
+      <int, Completer<Map<String, Object?>>>{};
+  int _nextDecodeRequestId = 1;
+  bool _readLoopRunning = false;
+  bool _decodeLoopRunning = false;
+  _PendingCompressedFrame? _pendingCompressedFrame;
+  int _decodedFrameCount = 0;
+  int _replacedCompressedFrameCount = 0;
 
   RemoteClient({
     required this.host,
@@ -247,47 +297,200 @@ class RemoteClient {
     _pending = Uint8List(0);
     _pendingOffset = 0;
     _authenticated = false;
-    _frameBuffer = null;
-    _currentFrameId = 0;
     _activeTransferId = null;
     _recentClipboardSyncIds.clear();
     _clipboardMode = 'manual';
     _lastAppliedClipboardHash = null;
     _lastAppliedClipboardAt = null;
+    _pendingCompressedFrame = null;
+    _readLoopRunning = false;
+    _decodeLoopRunning = false;
+    for (final pending in _pendingDecodeResponses.values) {
+      if (!pending.isCompleted) {
+        pending.completeError(const SocketException('frame decoder closed'));
+      }
+    }
+    _pendingDecodeResponses.clear();
+    _frameDecodeReceivePort?.close();
+    _frameDecodeReceivePort = null;
+    _frameDecodeSendPort = null;
+    _frameDecodeIsolate?.kill(priority: Isolate.immediate);
+    _frameDecodeIsolate = null;
     await _audioSink.stop();
   }
 
   Stream<Map<String, dynamic>> get controlMessages => _controlMessages.stream;
 
-  Future<Uint8List?> fetchSingleFrame() async {
+  Future<RemoteVideoFrame?> fetchSingleFrame() async {
     await connect();
+    return streamFrames().first;
+  }
 
-    while (true) {
-      final message = await _readMessage();
-      if (message == null) {
-        return null;
+  Stream<RemoteVideoFrame> streamFrames() {
+    unawaited(_startReadLoop());
+    return _videoFrames.stream;
+  }
+
+  Future<void> _startReadLoop() async {
+    if (_readLoopRunning) {
+      return;
+    }
+    await connect();
+    await _ensureFrameDecodeIsolate();
+    _readLoopRunning = true;
+    unawaited(() async {
+      try {
+        while (true) {
+          final message = await _readMessage();
+          if (message == null) {
+            break;
+          }
+          if (message.$1 == _msgControlInput) {
+            try {
+              final decoded = jsonDecode(utf8.decode(message.$2)) as Map<String, dynamic>;
+              await _handleControlMessage(decoded);
+            } catch (_) {
+              // Ignore malformed control messages from the host.
+            }
+            continue;
+          }
+          if (message.$1 == _msgAudioPacket) {
+            await _handleAudioPacket(message.$2);
+            continue;
+          }
+          if (message.$1 == _msgVideoFrame ||
+              message.$1 == _msgVideoKeyframe ||
+              message.$1 == _msgVideoDelta) {
+            _enqueueCompressedFrame(message.$1, message.$2);
+          }
+        }
+      } catch (err, stackTrace) {
+        if (!_videoFrames.isClosed) {
+          _videoFrames.addError(err, stackTrace);
+        }
+      } finally {
+        _readLoopRunning = false;
+        if (!_videoFrames.isClosed) {
+          await _videoFrames.close();
+        }
       }
+    }());
+  }
 
-      final output = await _decodeFrameMessage(message.$1, message.$2);
-      if (output != null) {
-        return output;
+  void _enqueueCompressedFrame(int messageType, Uint8List payload) {
+    final frameId = _peekFrameId(messageType, payload);
+    final receivedTimestampMs = DateTime.now().millisecondsSinceEpoch;
+    if (_pendingCompressedFrame != null) {
+      _replacedCompressedFrameCount += 1;
+      if (frameId % _frameLogSampleEvery == 0) {
+        print(
+          'video frame replaced before decode old_frame=${_pendingCompressedFrame!.frameId} new_frame=$frameId dropped_reason=decode_backlog total_replaced=$_replacedCompressedFrameCount',
+        );
+      }
+    }
+    _pendingCompressedFrame = _PendingCompressedFrame(
+      messageType: messageType,
+      payload: payload,
+      frameId: frameId,
+      receivedTimestampMs: receivedTimestampMs,
+    );
+    if (!_decodeLoopRunning) {
+      unawaited(_runDecodeLoop());
+    }
+  }
+
+  Future<void> _runDecodeLoop() async {
+    if (_decodeLoopRunning) {
+      return;
+    }
+    _decodeLoopRunning = true;
+    try {
+      while (true) {
+        final pendingFrame = _pendingCompressedFrame;
+        if (pendingFrame == null) {
+          break;
+        }
+        _pendingCompressedFrame = null;
+        final decoded = await _decodeFrameOnWorker(pendingFrame);
+        if (decoded['request_resync'] == true) {
+          print(
+            'video frame dropped frame_id=${pendingFrame.frameId} dropped_reason=${decoded['drop_reason'] ?? 'resync_required'}',
+          );
+          unawaited(requestResync());
+          continue;
+        }
+        final rgbaData = decoded['rgba'] as TransferableTypedData?;
+        if (rgbaData == null) {
+          continue;
+        }
+        final frame = RemoteVideoFrame(
+          frameId: decoded['frame_id'] as int,
+          width: decoded['width'] as int,
+          height: decoded['height'] as int,
+          rgbaBytes: rgbaData.materialize().asUint8List(),
+          captureTimestampMs: decoded['capture_timestamp_ms'] as int,
+          receivedTimestampMs: decoded['received_timestamp_ms'] as int,
+          messageType: pendingFrame.messageType,
+        );
+        _decodedFrameCount += 1;
+        if (frame.frameId % _frameLogSampleEvery == 0) {
+          print(
+            'video frame decoded frame_id=${frame.frameId} receive_ms=${frame.receivedTimestampMs} capture_ms=${frame.captureTimestampMs} age_ms=${frame.ageMs} width=${frame.width} height=${frame.height}',
+          );
+        }
+        if (!_videoFrames.isClosed) {
+          _videoFrames.add(frame);
+        }
+      }
+    } finally {
+      _decodeLoopRunning = false;
+      if (_pendingCompressedFrame != null) {
+        unawaited(_runDecodeLoop());
       }
     }
   }
 
-  Stream<Uint8List> streamFrames() async* {
-    await connect();
-    while (true) {
-      final message = await _readMessage();
-      if (message == null) {
-        break;
-      }
-
-      final output = await _decodeFrameMessage(message.$1, message.$2);
-      if (output != null) {
-        yield output;
-      }
+  Future<void> _ensureFrameDecodeIsolate() async {
+    if (_frameDecodeSendPort != null) {
+      return;
     }
+    final readyPort = ReceivePort();
+    final isolate = await Isolate.spawn(_frameDecodeIsolateMain, readyPort.sendPort);
+    final sendPort = await readyPort.first as SendPort;
+    readyPort.close();
+    final receivePort = ReceivePort();
+    sendPort.send(<String, Object?>{
+      'type': 'bind_reply',
+      'reply_port': receivePort.sendPort,
+    });
+    receivePort.listen((dynamic message) {
+      if (message is! Map) {
+        return;
+      }
+      final requestId = message['request_id'] as int?;
+      if (requestId == null) {
+        return;
+      }
+      _pendingDecodeResponses.remove(requestId)?.complete(message.cast<String, Object?>());
+    });
+    _frameDecodeIsolate = isolate;
+    _frameDecodeReceivePort = receivePort;
+    _frameDecodeSendPort = sendPort;
+  }
+
+  Future<Map<String, Object?>> _decodeFrameOnWorker(_PendingCompressedFrame frame) async {
+    await _ensureFrameDecodeIsolate();
+    final requestId = _nextDecodeRequestId++;
+    final completer = Completer<Map<String, Object?>>();
+    _pendingDecodeResponses[requestId] = completer;
+    _frameDecodeSendPort!.send(<String, Object?>{
+      'type': 'decode',
+      'request_id': requestId,
+      'message_type': frame.messageType,
+      'received_timestamp_ms': frame.receivedTimestampMs,
+      'payload': TransferableTypedData.fromList(<TypedData>[frame.payload]),
+    });
+    return completer.future;
   }
 
   Future<void> sendSettings({
@@ -562,111 +765,11 @@ class RemoteClient {
     return out;
   }
 
-  Future<Uint8List?> _decodeFrameMessage(int messageType, Uint8List payload) async {
-    if (messageType == _msgVideoFrame) {
-      return payload;
+  int _peekFrameId(int messageType, Uint8List payload) {
+    if ((messageType == _msgVideoKeyframe || messageType == _msgVideoDelta) && payload.length >= 4) {
+      return ByteData.sublistView(payload).getUint32(0, Endian.big);
     }
-    if (messageType == _msgControlInput) {
-      try {
-        final decoded = jsonDecode(utf8.decode(payload)) as Map<String, dynamic>;
-        await _handleControlMessage(decoded);
-      } catch (_) {
-        // Ignore malformed control messages from the host.
-      }
-      return null;
-    }
-    if (messageType == _msgVideoKeyframe) {
-      return _handleKeyframe(payload);
-    }
-    if (messageType == _msgVideoDelta) {
-      return _handleDelta(payload);
-    }
-    if (messageType == _msgAudioPacket) {
-      await _handleAudioPacket(payload);
-      return null;
-    }
-    return null;
-  }
-
-  Uint8List? _handleKeyframe(Uint8List payload) {
-    final data = ByteData.sublistView(payload);
-    if (payload.length < 17) {
-      return null;
-    }
-    final frameId = data.getUint32(0, Endian.big);
-    final codec = data.getUint8(12);
-    final imageLen = data.getUint32(13, Endian.big);
-    if (payload.length < 17 + imageLen) {
-      return null;
-    }
-    final imageBytes = payload.sublist(17, 17 + imageLen);
-    final decoded = _decodeImage(codec, imageBytes);
-    if (decoded == null) {
-      return null;
-    }
-    _frameBuffer = decoded;
-    _currentFrameId = frameId;
-    return Uint8List.fromList(img.encodePng(decoded));
-  }
-
-  Future<Uint8List?> _handleDelta(Uint8List payload) async {
-    final data = ByteData.sublistView(payload);
-    if (payload.length < 20) {
-      return null;
-    }
-    final frameId = data.getUint32(0, Endian.big);
-    final baseFrameId = data.getUint32(4, Endian.big);
-    final moveCount = data.getUint16(16, Endian.big);
-    final patchCount = data.getUint16(18, Endian.big);
-
-    final frameBuffer = _frameBuffer;
-    final frameWidth = data.getUint32(8, Endian.big);
-    final frameHeight = data.getUint32(12, Endian.big);
-    if (frameBuffer == null || _currentFrameId != baseFrameId || frameBuffer.width != frameWidth || frameBuffer.height != frameHeight) {
-      await requestResync();
-      return null;
-    }
-
-    var offset = 20;
-    for (var i = 0; i < moveCount; i += 1) {
-      if (payload.length < offset + 24) {
-        return null;
-      }
-      final srcX = data.getInt32(offset, Endian.big);
-      final srcY = data.getInt32(offset + 4, Endian.big);
-      final dstX = data.getInt32(offset + 8, Endian.big);
-      final dstY = data.getInt32(offset + 12, Endian.big);
-      final width = data.getUint32(offset + 16, Endian.big);
-      final height = data.getUint32(offset + 20, Endian.big);
-      _applyMove(frameBuffer, srcX, srcY, dstX, dstY, width, height);
-      offset += 24;
-    }
-
-    for (var i = 0; i < patchCount; i += 1) {
-      if (payload.length < offset + 21) {
-        return null;
-      }
-      final x = data.getInt32(offset, Endian.big);
-      final y = data.getInt32(offset + 4, Endian.big);
-      final width = data.getUint32(offset + 8, Endian.big);
-      final height = data.getUint32(offset + 12, Endian.big);
-      final codec = data.getUint8(offset + 16);
-      final imageLen = data.getUint32(offset + 17, Endian.big);
-      offset += 21;
-      if (payload.length < offset + imageLen) {
-        return null;
-      }
-      final patchBytes = payload.sublist(offset, offset + imageLen);
-      offset += imageLen;
-      final patch = _decodeImage(codec, patchBytes);
-      if (patch == null) {
-        continue;
-      }
-      _applyPatch(frameBuffer, patch, x, y, width, height);
-    }
-
-    _currentFrameId = frameId;
-    return Uint8List.fromList(img.encodePng(frameBuffer));
+    return 0;
   }
 
 
@@ -705,26 +808,6 @@ class RemoteClient {
         'message': err.toString(),
       });
     }
-  }
-  img.Image? _decodeImage(int codec, Uint8List bytes) {
-    switch (codec) {
-      case _codecJpeg:
-        return img.decodeJpg(bytes);
-      default:
-        return null;
-    }
-  }
-
-  void _applyPatch(img.Image target, img.Image patch, int x, int y, int width, int height) {
-    final normalizedPatch = (patch.width == width && patch.height == height)
-        ? patch
-        : img.copyResize(patch, width: width, height: height);
-    img.compositeImage(target, normalizedPatch, dstX: x, dstY: y);
-  }
-
-  void _applyMove(img.Image target, int srcX, int srcY, int dstX, int dstY, int width, int height) {
-    final copy = img.copyCrop(target, x: srcX, y: srcY, width: width, height: height);
-    img.compositeImage(target, copy, dstX: dstX, dstY: dstY);
   }
 
 
@@ -965,6 +1048,217 @@ class RemoteClient {
   String _normalizeFingerprint(String fp) {
     return fp.replaceAll(':', '').replaceAll(' ', '').toUpperCase();
   }
+}
+
+void _frameDecodeIsolateMain(SendPort readyPort) {
+  final commandPort = ReceivePort();
+  readyPort.send(commandPort.sendPort);
+
+  SendPort? replyPort;
+  img.Image? frameBuffer;
+  var currentFrameId = 0;
+
+  commandPort.listen((dynamic rawMessage) {
+    if (rawMessage is! Map) {
+      return;
+    }
+    final message = rawMessage.cast<String, Object?>();
+    final type = message['type'] as String?;
+    if (type == 'bind_reply') {
+      replyPort = message['reply_port'] as SendPort?;
+      return;
+    }
+    if (type != 'decode' || replyPort == null) {
+      return;
+    }
+
+    final requestId = message['request_id'] as int;
+    final messageType = message['message_type'] as int;
+    final receivedTimestampMs = message['received_timestamp_ms'] as int;
+    final payload = (message['payload'] as TransferableTypedData).materialize().asUint8List();
+    final response = _decodeFramePayloadInIsolate(
+      frameBuffer: frameBuffer,
+      currentFrameId: currentFrameId,
+      messageType: messageType,
+      payload: payload,
+      receivedTimestampMs: receivedTimestampMs,
+    );
+
+    if (response case {'frame_buffer': final img.Image nextFrameBuffer}) {
+      frameBuffer = nextFrameBuffer;
+      currentFrameId = response['frame_id'] as int;
+    }
+
+    replyPort!.send(<String, Object?>{
+      'request_id': requestId,
+      ...response..remove('frame_buffer'),
+    });
+  });
+}
+
+Map<String, Object?> _decodeFramePayloadInIsolate({
+  required img.Image? frameBuffer,
+  required int currentFrameId,
+  required int messageType,
+  required Uint8List payload,
+  required int receivedTimestampMs,
+}) {
+  if (messageType == _msgVideoFrame) {
+    return <String, Object?>{};
+  }
+  if (messageType == _msgVideoKeyframe) {
+    return _decodeKeyframeInIsolate(payload, receivedTimestampMs);
+  }
+  if (messageType == _msgVideoDelta) {
+    return _decodeDeltaInIsolate(
+      frameBuffer: frameBuffer,
+      currentFrameId: currentFrameId,
+      payload: payload,
+      receivedTimestampMs: receivedTimestampMs,
+    );
+  }
+  return <String, Object?>{};
+}
+
+Map<String, Object?> _decodeKeyframeInIsolate(Uint8List payload, int receivedTimestampMs) {
+  final data = ByteData.sublistView(payload);
+  if (payload.length < 25) {
+    return <String, Object?>{'drop_reason': 'short_keyframe'};
+  }
+  final frameId = data.getUint32(0, Endian.big);
+  final captureTimestampMs = data.getUint64(4, Endian.big);
+  final width = data.getUint32(12, Endian.big);
+  final height = data.getUint32(16, Endian.big);
+  final codec = data.getUint8(20);
+  final imageLen = data.getUint32(21, Endian.big);
+  if (payload.length < 25 + imageLen) {
+    return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_keyframe'};
+  }
+  final imageBytes = payload.sublist(25, 25 + imageLen);
+  final decoded = _decodeImageInIsolate(codec, imageBytes);
+  if (decoded == null) {
+    return <String, Object?>{'frame_id': frameId, 'drop_reason': 'decode_failed'};
+  }
+  return <String, Object?>{
+    'frame_id': frameId,
+    'width': width,
+    'height': height,
+    'capture_timestamp_ms': captureTimestampMs,
+    'received_timestamp_ms': receivedTimestampMs,
+    'rgba': TransferableTypedData.fromList(<TypedData>[
+      Uint8List.fromList(decoded.getBytes(order: img.ChannelOrder.rgba)),
+    ]),
+    'frame_buffer': decoded,
+  };
+}
+
+Map<String, Object?> _decodeDeltaInIsolate({
+  required img.Image? frameBuffer,
+  required int currentFrameId,
+  required Uint8List payload,
+  required int receivedTimestampMs,
+}) {
+  final data = ByteData.sublistView(payload);
+  if (payload.length < 28) {
+    return <String, Object?>{'drop_reason': 'short_delta'};
+  }
+  final frameId = data.getUint32(0, Endian.big);
+  final baseFrameId = data.getUint32(4, Endian.big);
+  final captureTimestampMs = data.getUint64(8, Endian.big);
+  final frameWidth = data.getUint32(16, Endian.big);
+  final frameHeight = data.getUint32(20, Endian.big);
+  final moveCount = data.getUint16(24, Endian.big);
+  final patchCount = data.getUint16(26, Endian.big);
+
+  if (frameBuffer == null ||
+      currentFrameId != baseFrameId ||
+      frameBuffer.width != frameWidth ||
+      frameBuffer.height != frameHeight) {
+    return <String, Object?>{
+      'frame_id': frameId,
+      'request_resync': true,
+      'drop_reason': 'base_frame_mismatch',
+    };
+  }
+
+  var offset = 28;
+  for (var i = 0; i < moveCount; i += 1) {
+    if (payload.length < offset + 24) {
+      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_move'};
+    }
+    final srcX = data.getInt32(offset, Endian.big);
+    final srcY = data.getInt32(offset + 4, Endian.big);
+    final dstX = data.getInt32(offset + 8, Endian.big);
+    final dstY = data.getInt32(offset + 12, Endian.big);
+    final width = data.getUint32(offset + 16, Endian.big);
+    final height = data.getUint32(offset + 20, Endian.big);
+    _applyMoveInIsolate(frameBuffer, srcX, srcY, dstX, dstY, width, height);
+    offset += 24;
+  }
+
+  for (var i = 0; i < patchCount; i += 1) {
+    if (payload.length < offset + 21) {
+      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_patch_header'};
+    }
+    final x = data.getInt32(offset, Endian.big);
+    final y = data.getInt32(offset + 4, Endian.big);
+    final width = data.getUint32(offset + 8, Endian.big);
+    final height = data.getUint32(offset + 12, Endian.big);
+    final codec = data.getUint8(offset + 16);
+    final imageLen = data.getUint32(offset + 17, Endian.big);
+    offset += 21;
+    if (payload.length < offset + imageLen) {
+      return <String, Object?>{'frame_id': frameId, 'drop_reason': 'truncated_patch_data'};
+    }
+    final patchBytes = payload.sublist(offset, offset + imageLen);
+    offset += imageLen;
+    final patch = _decodeImageInIsolate(codec, patchBytes);
+    if (patch == null) {
+      continue;
+    }
+    _applyPatchInIsolate(frameBuffer, patch, x, y, width, height);
+  }
+
+  return <String, Object?>{
+    'frame_id': frameId,
+    'width': frameWidth,
+    'height': frameHeight,
+    'capture_timestamp_ms': captureTimestampMs,
+    'received_timestamp_ms': receivedTimestampMs,
+    'rgba': TransferableTypedData.fromList(<TypedData>[
+      Uint8List.fromList(frameBuffer.getBytes(order: img.ChannelOrder.rgba)),
+    ]),
+    'frame_buffer': frameBuffer,
+  };
+}
+
+img.Image? _decodeImageInIsolate(int codec, Uint8List bytes) {
+  switch (codec) {
+    case _codecJpeg:
+      return img.decodeJpg(bytes);
+    default:
+      return null;
+  }
+}
+
+void _applyPatchInIsolate(img.Image target, img.Image patch, int x, int y, int width, int height) {
+  final normalizedPatch = (patch.width == width && patch.height == height)
+      ? patch
+      : img.copyResize(patch, width: width, height: height);
+  img.compositeImage(target, normalizedPatch, dstX: x, dstY: y);
+}
+
+void _applyMoveInIsolate(
+  img.Image target,
+  int srcX,
+  int srcY,
+  int dstX,
+  int dstY,
+  int width,
+  int height,
+) {
+  final copy = img.copyCrop(target, x: srcX, y: srcY, width: width, height: height);
+  img.compositeImage(target, copy, dstX: dstX, dstY: dstY);
 }
 
 
